@@ -1,0 +1,94 @@
+{
+  "track_total_hits": false,
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "terms": {
+            "processor.event": [
+              "metric"
+            ]
+          }
+        }
+      ],
+      "must": [
+        {
+          "bool": {
+            "filter": [
+              {
+                "bool": {
+                  "should": [
+                    {
+                      "query_string": {
+                        "fields": [
+                          "span.destination.service.resource"
+                        ],
+                        "query": "*as400*"
+                      }
+                    }
+                  ],
+                  "minimum_should_match": 1
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": 1768147200000,
+                    "lte": 1768791660770,
+                    "format": "epoch_millis"
+                  }
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "metricset.name": "service_destination"
+                      }
+                    }
+                  ],
+                  "must_not": {
+                    "terms": {
+                      "metricset.interval": [
+                        "10m",
+                        "60m"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "term": {
+                  "span.destination.service.resource": "as400"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "timeseries": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "10800s",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": 1768147200000,
+          "max": 1768791660770
+        }
+      },
+      "aggs": {
+        "throughput": {
+          "rate": {
+            "field": "span.destination.service.response_time.count",
+            "unit": "minute"
+          }
+        }
+      }
+    }
+  }
+}
