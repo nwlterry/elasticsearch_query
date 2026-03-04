@@ -5,72 +5,43 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo ""
 
-ES_HOST="localhost:9200"   # change if needed, e.g. to your-domain:9200 or IP
+ES_HOST="localhost:9200"   # ← change to https:// if needed, add -k to curl if self-signed
 
-echo "Fetching index sizes in bytes..."
+echo "Fetching sizes..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
   -o sizes.json \
-  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
+  "https://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
 
-if [ ! -s sizes.json ]; then
-  echo "ERROR: sizes.json is empty (0 bytes). Check credentials, host, or network."
-  echo "Manual test command:"
-  echo "  curl -u \"${ES_USER}:***\" \"http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b\""
+echo "Fetching all ILM explain at once..."
+curl -s -u "${ES_USER}:${ES_PASS}" \
+  -o ilm.json \
+  "https://${ES_HOST}/_ilm/explain?human"
+
+if [ ! -s sizes.json ] || [ ! -s ilm.json ]; then
+  echo "One of the files is empty — check auth/host/response."
   exit 1
 fi
 
-echo "sizes.json fetched ($(wc -c < sizes.json | awk '{print $1}') bytes)"
-echo "First few bytes of response (for debug):"
-head -c 300 sizes.json | cat -v || true
-echo ""
+echo "Combining data..."
 
-# Detect key style and set variables
-if grep -q '"store_size"' sizes.json; then
-  TOTAL_KEY="store_size"
-  PRI_KEY="pri_store_size"
-  echo "Detected snake_case keys"
-elif grep -q '"store.size"' sizes.json; then
-  TOTAL_KEY="store.size"
-  PRI_KEY="pri.store.size"
-  echo "Detected dotted keys (store.size / pri.store.size) – using correct jq syntax"
-else
-  echo "WARNING: No recognizable store size keys found → sizes will be 0"
-  TOTAL_KEY="store.size"  # fallback
-  PRI_KEY="pri.store.size"
-fi
-
-# Extract with proper dotted-key support in jq
-jq -r --arg t "$TOTAL_KEY" --arg p "$PRI_KEY" '
-  .[] 
-  | [.index, (.[$t] // 0), (.[$p] // 0)] 
-  | @tsv
+jq -r --slurpfile ilm ilm.json '
+  . as $sizes
+  | $ilm[0].indices as $ilm_data
+  | $sizes[]
+  | .index as $idx
+  | [$idx,
+     (.store.size // 0),
+     (.pri.store.size // 0),
+     ($ilm_data[$idx].policy // "unmanaged"),
+     ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed then "no-phase" else "unmanaged (no phase)" end))
+    ] | @tsv
 ' sizes.json \
-  | while IFS=$'\t' read -r idx total_bytes pri_bytes; do
-      # Skip if index is empty/malformed
-      [ -z "$idx" ] && continue
-
-      echo "DEBUG: Processing index $idx (bytes: $total_bytes / $pri_bytes)" >&2
-
-      phase_info=$(curl -s -u "${ES_USER}:${ES_PASS}" \
-        "http://${ES_HOST}/$idx/_ilm/explain?pretty" \
-        | jq -r --arg idx "$idx" '
-            (.indices[$idx] // {managed: false}) |
-            if .managed then
-              [.policy // "none", .phase // "-"] | join("\t")
-            else
-              "unmanaged\t-"
-            end' 2>/dev/null || echo "unmanaged\t- (error)")
-
-      echo -e "$idx\t$total_bytes\t$pri_bytes\t$phase_info"
-    done \
   | sort -k2 -n -r \
   | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
 
 echo ""
-echo "Done. If still no rows appear below header:"
-echo "- Check DEBUG lines above for processing info"
-echo "- Run: jq '.[0]' sizes.json   → paste the output here for further debug"
-echo "- Or try without &expand_wildcards=open if indices are closed/hidden"
-
-# rm -f sizes.json  # uncomment to auto-clean
+echo "Notes:"
+echo "- If POLICY is 'unmanaged' for everything → your indices have no ILM attached (common if not using data streams/templates)."
+echo "- To attach ILM to existing index: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy-name\" }"
+echo "- Run GET _ilm/explain?pretty manually to verify."
