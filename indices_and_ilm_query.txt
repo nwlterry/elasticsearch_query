@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ================================================
-# Elasticsearch ILM + Indices Size Report + ILM Policies Export
+# Elasticsearch ILM + Indices Size Report + ILM Policies Export (JSON + CSV)
 # - Shows index names, total/primary bytes, ILM policy & phase
 # - Sorted by total size descending
 # - Prompts for credentials
-# - Optional: Export all ILM policies JSON
+# - Optional: Export all ILM policies (JSON + CSV)
 # ================================================
 
 echo "Script started at $(date)"
@@ -43,13 +43,10 @@ echo "sizes.json size: $(wc -c < sizes.json) bytes"
 # ────────────────────────────────────────────────
 echo -e "\n[2/2] Fetching ILM info per index..."
 
-# Output table header
 echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE" > report.tsv
 
 jq -r '.[] | [.index, .["store.size"] // .store_size // 0, .["pri.store.size"] // .pri_store_size // 0] | @tsv' sizes.json |
 while IFS=$'\t' read -r idx total pri; do
-  echo "DEBUG: Processing ${idx} ..."
-
   ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_HOST}/${idx}/_ilm/explain?human" 2>/dev/null)
 
   if [[ -z "${ilm_resp}" ]]; then
@@ -63,37 +60,63 @@ while IFS=$'\t' read -r idx total pri; do
   echo -e "${idx}\t${total}\t${pri}\t${policy}\t${phase}" >> report.tsv
 done
 
-# Sort by size desc (skip header) and display
 tail -n +2 report.tsv | sort -k2 -n -r | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) | column -t -s $'\t'
 
-echo -e "\nReport complete. ${#} indices processed."
+echo -e "\nReport complete."
 
 # ────────────────────────────────────────────────
 echo -e "\n=== ILM Policies Export Session ==="
 
-read -p "Export all ILM policies with full config (JSON) for lookup/backup? (y/N): " export_choice
-if [[ "${export_choice,,}" == "y" || "${export_choice,,}" == "yes" ]]; then
+read -p "Export all ILM policies (JSON + CSV) for lookup/backup? (y/N): " export_choice
+if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "Fetching all ILM policies..."
 
   timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
-  export_file="ilm_policies_export_${timestamp}.json"
+  json_file="ilm_policies_export_${timestamp}.json"
+  csv_file="ilm_policies_export_${timestamp}.csv"
 
   policies_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
-    -o "${export_file}" -w "%{http_code}" \
+    -o "${json_file}" -w "%{http_code}" \
     "${ES_HOST}/_ilm/policy?pretty&human")
 
-  if [ "${policies_http}" -eq 200 ] && [ -s "${export_file}" ]; then
-    policy_count=$(jq 'length' "${export_file}" 2>/dev/null || echo "unknown")
-    echo "Success! Exported ${policy_count} policies to: ${export_file}"
+  if [ "${policies_http}" -eq 200 ] && [ -s "${json_file}" ]; then
+    policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "unknown")
+
+    echo "Success! Exported ${policy_count} policies"
+    echo "Files created:"
+    echo "  - JSON: ${json_file}"
+    echo "  - CSV:  ${csv_file}"
+
     echo "Policy names:"
-    jq 'keys[]' "${export_file}" 2>/dev/null | sort || echo "(could not list names)"
-    echo ""
-    echo "You can view it with: cat ${export_file} | jq ."
-    echo "Or re-apply one policy: curl -X PUT -u user:pass -H 'Content-Type: application/json' '${ES_HOST}/_ilm/policy/my-policy' -d @ilm_policies_export_....json"
+    jq 'keys[]' "${json_file}" 2>/dev/null | sort || echo "(could not list)"
+
+    # ────────────── Generate CSV ──────────────
+    jq -r '
+      to_entries[]
+      | .key as $name
+      | .value
+      | [
+          $name,
+          (.version // "null"),
+          (.modified_date // "null"),
+          (.policy.phases | keys | join(", ")),
+          (.policy.phases | to_entries | map(
+            if .value.min_age? then .key + ":\( .value.min_age )" else empty end
+          ) | join(", ")),
+          (.policy.phases.hot?.actions.rollover? | tojson // "null"),
+          tojson
+        ] | @csv
+    ' "${json_file}" > "${csv_file}"
+
+    echo -e "\nCSV columns:"
+    echo "policy_name, version, modified_date, phases, min_age_summary, rollover_conditions, full_config_json"
+
+    echo -e "\nTip: Open ${csv_file} in Excel/Google Sheets for quick lookup."
+    echo "View JSON: cat ${json_file} | jq ."
   else
     echo "ERROR: Export failed (HTTP ${policies_http})"
-    head -n 10 "${export_file}" || echo "(file empty)"
-    rm -f "${export_file}" 2>/dev/null
+    head -n 10 "${json_file}" || echo "(file empty)"
+    rm -f "${json_file}" "${csv_file}" 2>/dev/null
   fi
 else
   echo "Export skipped."
@@ -101,9 +124,8 @@ fi
 
 echo -e "\n=== Done ===\n"
 
-# Cleanup prompt
-read -p "Remove temporary files (sizes.json, report.tsv)? (y/N): " cleanup
-if [[ "${cleanup,,}" == "y" || "${cleanup,,}" == "yes" ]]; then
-  rm -f sizes.json report.tsv
+read -p "Remove temporary files (sizes.json, report.tsv, export files)? (y/N): " cleanup
+if [[ "${cleanup,,}" =~ ^(y|yes)$ ]]; then
+  rm -f sizes.json report.tsv ilm_policies_export_*.json ilm_policies_export_*.csv 2>/dev/null
   echo "Temp files removed."
 fi
