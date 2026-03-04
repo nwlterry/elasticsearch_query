@@ -1,8 +1,14 @@
-curl -s -X GET "localhost:9200/_cat/indices?format=json&h=index,health,status,pri,rep,docs.count,store.size,pri.store.size" \
-  | jq -r '.[] | .index' \
-  | while read idx; do
-      curl -s "localhost:9200/$idx/_ilm/explain?pretty" \
-        | jq -r --arg idx "$idx" '
-          .indices[$idx] |
-          [$idx, (.policy // "unmanaged"), (.phase // "-"), (.action // "-")] | @tsv'
-    done
+curl -s -X GET "localhost:9200/_cat/indices?format=json&h=index,store.size,pri.store.size&expand_wildcards=open" -u elastic:your_password \
+  | jq -r '.[] | [.index, .store_size, .pri_store_size] | @tsv' \
+  | while read -r idx total_size pri_size; do
+      phase_info=$(curl -s "localhost:9200/$idx/_ilm/explain?pretty" -u elastic:your_password \
+        | jq -r '.indices."'"$idx"'" | 
+          if .managed then 
+            [.policy // "none", .phase // "-"] | join("\t") 
+          else 
+            "unmanaged\t-" 
+          end')
+      echo -e "$idx\t$total_size\t$pri_size\t$phase_info"
+    done \
+  | (echo -e "INDEX\tSTORE.SIZE\tPRI.STORE.SIZE\tILM.POLICY\tPHASE"; cat -) \
+  | column -t -s $'\t'
