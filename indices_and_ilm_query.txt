@@ -2,83 +2,112 @@
 set -euo pipefail
 
 # ================================================
-# Elasticsearch ILM + Indices Size Report
-# - Shows index names, total/primary bytes, ILM policy & phase
-# - Sorted by total size descending
-# - Prompts for credentials
+# Elasticsearch ILM + Indices Size Report - DEBUG VERSION
 # ================================================
+
+echo "Script started at $(date)"
 
 read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
-echo ""
+echo -e "\n"
 
-# Change if needed (e.g. https://your-es-cluster:9200)
+# Change if your cluster uses TLS (most do in production)
 ES_HOST="localhost:9200"
+# ES_HOST="your-es-domain.com:9200"   # example alternative
 
-echo "Fetching index sizes in bytes..."
-curl -s -u "${ES_USER}:${ES_PASS}" \
+echo "=== DEBUG: Using host → http://${ES_HOST} ==="
+
+# ────────────────────────────────────────────────
+echo -e "\n[1/2] Fetching index sizes..."
+
+sizes_http_code=$(curl -s -u "${ES_USER}:${ES_PASS}" \
   -o sizes.json \
-  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
+  -w "%{http_code}" \
+  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open")
 
-echo "Fetching all ILM explain data..."
-curl -s -u "${ES_USER}:${ES_PASS}" \
-  -o ilm.json \
-  "http://${ES_HOST}/_ilm/explain?human"
+echo "Sizes API HTTP status: ${sizes_http_code}"
 
-# Basic validation
-if [ ! -s sizes.json ] || [ ! -s ilm.json ]; then
-  echo ""
-  echo "ERROR: One or both response files are empty."
-  echo "Possible causes:"
-  echo "  - Invalid credentials"
-  echo "  - Wrong host/port (try https:// if TLS is required)"
-  echo "  - No open indices"
-  echo "  - Permissions issue"
-  echo ""
-  echo "Try running this manually:"
-  echo "  curl -u \"${ES_USER}:***\" \"http://${ES_HOST}/_cat/indices?format=json&h=index,store.size\""
+if [ ! -f sizes.json ] || [ ! -s sizes.json ]; then
+  echo "ERROR: sizes.json is missing or empty"
+  echo "HTTP code was: ${sizes_http_code}"
   exit 1
 fi
 
-echo "Combining data and generating report..."
+sizes_file_size=$(wc -c < sizes.json | awk '{print $1}')
+echo "sizes.json created, size: ${sizes_file_size} bytes"
 
-jq -r --slurpfile ilm ilm.json '
+echo "First 300 chars of sizes.json (for debug):"
+head -c 300 sizes.json | cat -v || echo "(could not read file)"
+
+# Quick check if it looks like JSON array
+if grep -q '^\s*\[' sizes.json; then
+  echo "Looks like starts with array ["
+else
+  echo "WARNING: Does NOT start with JSON array [ → probably error response"
+fi
+
+# ────────────────────────────────────────────────
+echo -e "\n[2/2] Fetching ILM explain..."
+
+ilm_http_code=$(curl -s -u "${ES_USER}:${ES_PASS}" \
+  -o ilm.json \
+  -w "%{http_code}" \
+  "http://${ES_HOST}/_ilm/explain?human")
+
+echo "ILM API HTTP status: ${ilm_http_code}"
+
+if [ ! -f ilm.json ] || [ ! -s ilm.json ]; then
+  echo "ERROR: ilm.json is missing or empty"
+  echo "HTTP code was: ${ilm_http_code}"
+  exit 1
+fi
+
+ilm_file_size=$(wc -c < ilm.json | awk '{print $1}')
+echo "ilm.json created, size: ${ilm_file_size} bytes"
+
+echo "First 300 chars of ilm.json:"
+head -c 300 ilm.json | cat -v || echo "(could not read file)"
+
+# ────────────────────────────────────────────────
+echo -e "\n=== Starting jq combine step ==="
+
+# Try jq with extra debug
+jq_output=$(jq -r --slurpfile ilm ilm.json '
   . as $sizes
   | $ilm[0].indices as $ilm_data
 
-  # Debug: count how many indices are actually managed
   | ($ilm_data | to_entries | map(select(.value.managed == true)) | length) as $managed_count
   | ($ilm_data | length) as $total_explained
+
   | "DEBUG: Found \($managed_count) managed indices out of \($total_explained) explained indices",
 
-    $sizes[]
-    | .index as $idx
-    | [$idx,
-       (.["store.size"] // .store_size // 0),
-       (.["pri.store.size"] // .pri_store_size // 0),
-       ($ilm_data[$idx].policy // "unmanaged"),
-       ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed // false then "managed-no-phase-yet" else "not managed" end))
-      ] | @tsv
-' sizes.json \
-  | sort -k2 -n -r \
-  | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
-  | column -t -s $'\t'
+    if type != "array" then
+      "ERROR: sizes response is not array → type = " + (type | tostring)
+    else
+      $sizes[]
+      | .index as $idx
+      | [$idx,
+         (.["store.size"] // .store_size // 0),
+         (.["pri.store.size"] // .pri_store_size // 0),
+         ($ilm_data[$idx].policy // "unmanaged"),
+         ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed // false then "managed-no-phase-yet" else "not managed" end))
+        ] | @tsv
+    end
+' sizes.json 2>&1)
 
+# Show what jq produced
+echo "$jq_output" \
+  | sort -k2 -n -r 2>/dev/null \
+  | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
+  | column -t -s $'\t' || echo "Table formatting failed"
+
+echo -e "\n=== Script finished ===\n"
+
+echo "Quick troubleshooting guide:"
+echo "1. If HTTP status ≠ 200 → credentials, protocol (try https), or permissions issue"
+echo "2. If file size 0 or very small + HTTP 200 → probably empty response or error body"
+echo "3. If starts with {\"error\" → auth or privilege problem"
+echo "4. Try changing to https:// and add -k to curl if self-signed cert"
+echo "   Example: curl -s -k -u \"...\" \"https://${ES_HOST}/...\""
 echo ""
-echo "Legend / Notes:"
-echo "  STORE_BYTES     = total disk usage (primaries + replicas)"
-echo "  PRI_STORE_BYTES = primary shards only (raw data size)"
-echo "  ILM.POLICY      = 'unmanaged' means no lifecycle policy is attached"
-echo "  PHASE           = only shown if managed; common values: hot, warm, cold, frozen, delete"
-echo ""
-echo "If all indices show 'unmanaged' / 'not managed':"
-echo "  → They do not have an ILM policy attached (common for manually created indices)"
-echo "  → To attach one: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy\" }"
-echo "  → Verify single index: GET your-index/_ilm/explain?pretty"
-echo ""
-echo "Cleanup temporary files? (y/N)"
-read -r cleanup
-if [[ "$cleanup" =~ ^[Yy]$ ]]; then
-  rm -f sizes.json ilm.json
-  echo "Files removed."
-fi
+echo "Paste the most interesting lines above (HTTP codes, file sizes, first chars, DEBUG line, any ERROR from jq) for next step."
