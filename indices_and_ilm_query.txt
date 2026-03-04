@@ -5,43 +5,50 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo ""
 
-ES_HOST="localhost:9200"   # ← change to https:// if needed, add -k to curl if self-signed
+ES_HOST="localhost:9200"   # change to https://your-es-host:9200 if needed
 
-echo "Fetching sizes..."
+echo "Fetching index sizes (bytes)..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
   -o sizes.json \
   "https://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
 
-echo "Fetching all ILM explain at once..."
+echo "Fetching full ILM explain (all indices)..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
   -o ilm.json \
   "https://${ES_HOST}/_ilm/explain?human"
 
 if [ ! -s sizes.json ] || [ ! -s ilm.json ]; then
-  echo "One of the files is empty — check auth/host/response."
+  echo "ERROR: One of the response files is empty. Check credentials, URL, or cluster response."
   exit 1
 fi
 
-echo "Combining data..."
+echo "Combining sizes + ILM data..."
 
+# jq processing with debug count of managed indices
 jq -r --slurpfile ilm ilm.json '
   . as $sizes
   | $ilm[0].indices as $ilm_data
-  | $sizes[]
-  | .index as $idx
-  | [$idx,
-     (.store.size // 0),
-     (.pri.store.size // 0),
-     ($ilm_data[$idx].policy // "unmanaged"),
-     ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed then "no-phase" else "unmanaged (no phase)" end))
-    ] | @tsv
+  | ($ilm_data | to_entries | map(select(.value.managed == true)) | length) as $managed_count
+  | "DEBUG: Found " + ($managed_count | tostring) + " managed indices out of " + ($ilm_data | length | tostring) + " total explained indices" ,
+    $sizes[]
+    | .index as $idx
+    | [$idx,
+       (.store.size // 0),
+       (.pri.store.size // 0),
+       ($ilm_data[$idx].policy // "unmanaged"),
+       ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed then "unknown-phase" else "not managed" end))
+      ] | @tsv
 ' sizes.json \
   | sort -k2 -n -r \
   | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
 
 echo ""
-echo "Notes:"
-echo "- If POLICY is 'unmanaged' for everything → your indices have no ILM attached (common if not using data streams/templates)."
-echo "- To attach ILM to existing index: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy-name\" }"
-echo "- Run GET _ilm/explain?pretty manually to verify."
+echo "If all policies still show 'unmanaged':"
+echo "  → Run manually: GET your-index-name/_ilm/explain?pretty"
+echo "  → If 'managed': false → indices have no ILM policy attached"
+echo "  → To fix existing indices: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy-name\" }"
+echo "  → New indices need index template with index.lifecycle.name"
+echo "  → Also check: GET _ilm/status?pretty  (should be RUNNING)"
+echo ""
+echo "Paste the DEBUG line and a sample row if still not what you expect."
