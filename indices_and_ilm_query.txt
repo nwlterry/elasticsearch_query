@@ -1,0 +1,8 @@
+curl -s -X GET "localhost:9200/_cat/indices?format=json&h=index,health,status,pri,rep,docs.count,store.size,pri.store.size" \
+  | jq -r '.[] | .index' \
+  | while read idx; do
+      curl -s "localhost:9200/$idx/_ilm/explain?pretty" \
+        | jq -r --arg idx "$idx" '
+          .indices[$idx] |
+          [$idx, (.policy // "unmanaged"), (.phase // "-"), (.action // "-")] | @tsv'
+    done
