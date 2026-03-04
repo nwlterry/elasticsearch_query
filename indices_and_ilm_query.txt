@@ -5,50 +5,75 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo ""
 
-ES_HOST="localhost:9200"   # change to https://your-es-host:9200 if needed
+ES_HOST="localhost:9200"   # ← change to https:// if your cluster uses TLS
 
-echo "Fetching index sizes (bytes)..."
+echo "Fetching index sizes..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
   -o sizes.json \
-  "https://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
+  -w "%{http_code}" \
+  "https://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open" > http_code.txt
 
-echo "Fetching full ILM explain (all indices)..."
+HTTP_CODE=$(cat http_code.txt | tr -d '\n')
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "ERROR: HTTP $HTTP_CODE — not OK response"
+  echo "Raw first lines of response:"
+  head -n 10 sizes.json
+  echo "Fix: Check credentials, try https://, or verify with Kibana/console."
+  exit 1
+fi
+
+if [ ! -s sizes.json ]; then
+  echo "ERROR: sizes.json empty"
+  exit 1
+fi
+
+# Test if it's an array
+ARRAY_CHECK=$(jq 'if type == "array" then "ok" else "not-array: " + type end' sizes.json)
+
+if [[ "$ARRAY_CHECK" != *"ok"* ]]; then
+  echo "ERROR: Response is not a JSON array → jq will fail"
+  echo "Type: $ARRAY_CHECK"
+  echo "First 300 chars:"
+  head -c 300 sizes.json | cat -v
+  echo ""
+  echo "Likely an error message instead of data. Check auth/permissions."
+  exit 1
+fi
+
+echo "Fetching ILM explain..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
   -o ilm.json \
   "https://${ES_HOST}/_ilm/explain?human"
 
-if [ ! -s sizes.json ] || [ ! -s ilm.json ]; then
-  echo "ERROR: One of the response files is empty. Check credentials, URL, or cluster response."
-  exit 1
-fi
+echo "Combining data (with null-safety)..."
 
-echo "Combining sizes + ILM data..."
-
-# jq processing with debug count of managed indices
 jq -r --slurpfile ilm ilm.json '
   . as $sizes
   | $ilm[0].indices as $ilm_data
   | ($ilm_data | to_entries | map(select(.value.managed == true)) | length) as $managed_count
-  | "DEBUG: Found " + ($managed_count | tostring) + " managed indices out of " + ($ilm_data | length | tostring) + " total explained indices" ,
+  | "DEBUG: Found \($managed_count) managed indices",
     $sizes[]
     | .index as $idx
     | [$idx,
-       (.store.size // 0),
-       (.pri.store.size // 0),
+       (.["store.size"] // .store_size // 0),
+       (.["pri.store.size"] // .pri_store_size // 0),
        ($ilm_data[$idx].policy // "unmanaged"),
-       ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed then "unknown-phase" else "not managed" end))
+       ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed // false then "unknown-phase" else "not managed" end))
       ] | @tsv
-' sizes.json \
+' sizes.json 2> jq_error.log \
   | sort -k2 -n -r \
   | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
 
+if [ -s jq_error.log ]; then
+  echo ""
+  echo "jq had warnings/errors:"
+  cat jq_error.log
+fi
+
 echo ""
-echo "If all policies still show 'unmanaged':"
-echo "  → Run manually: GET your-index-name/_ilm/explain?pretty"
-echo "  → If 'managed': false → indices have no ILM policy attached"
-echo "  → To fix existing indices: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy-name\" }"
-echo "  → New indices need index template with index.lifecycle.name"
-echo "  → Also check: GET _ilm/status?pretty  (should be RUNNING)"
-echo ""
-echo "Paste the DEBUG line and a sample row if still not what you expect."
+echo "If still issues, paste:"
+echo "- The DEBUG line"
+echo "- Output of: jq '.[0]' sizes.json   (first index object)"
+echo "- Or run manual GET _cat/indices?format=json&h=store.size"
