@@ -1,39 +1,84 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ================================================
+# Elasticsearch ILM + Indices Size Report
+# - Shows index names, total/primary bytes, ILM policy & phase
+# - Sorted by total size descending
+# - Prompts for credentials
+# ================================================
+
 read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo ""
 
-ES_HOST="localhost:9200"  # try "https://localhost:9200" if needed
+# Change if needed (e.g. https://your-es-cluster:9200)
+ES_HOST="localhost:9200"
 
-echo "Fetching sizes..."
+echo "Fetching index sizes in bytes..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open" > sizes.json
+  -o sizes.json \
+  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
 
-if [ ! -s sizes.json ]; then
-  echo "sizes.json is empty"
+echo "Fetching all ILM explain data..."
+curl -s -u "${ES_USER}:${ES_PASS}" \
+  -o ilm.json \
+  "http://${ES_HOST}/_ilm/explain?human"
+
+# Basic validation
+if [ ! -s sizes.json ] || [ ! -s ilm.json ]; then
+  echo ""
+  echo "ERROR: One or both response files are empty."
+  echo "Possible causes:"
+  echo "  - Invalid credentials"
+  echo "  - Wrong host/port (try https:// if TLS is required)"
+  echo "  - No open indices"
+  echo "  - Permissions issue"
+  echo ""
+  echo "Try running this manually:"
+  echo "  curl -u \"${ES_USER}:***\" \"http://${ES_HOST}/_cat/indices?format=json&h=index,store.size\""
   exit 1
 fi
 
-echo "Response type:"
-jq 'type' sizes.json || echo "jq failed to parse"
+echo "Combining data and generating report..."
 
-echo "Number of indices:"
-jq 'length' sizes.json 2>/dev/null || echo "Not an array"
+jq -r --slurpfile ilm ilm.json '
+  . as $sizes
+  | $ilm[0].indices as $ilm_data
 
-echo "First index (if exists):"
-jq '.[0]' sizes.json 2>/dev/null || echo "No elements or invalid"
+  # Debug: count how many indices are actually managed
+  | ($ilm_data | to_entries | map(select(.value.managed == true)) | length) as $managed_count
+  | ($ilm_data | length) as $total_explained
+  | "DEBUG: Found \($managed_count) managed indices out of \($total_explained) explained indices",
 
-# Try to print table even if partial
-jq -r '
-  if type == "array" then
-    .[]
-    | [.index // "?", .["store.size"] // .store_size // 0, .["pri.store.size"] // .pri_store_size // 0]
-    | @tsv
-  else
-    "Response is not array: " + (tostring)
-  end
+    $sizes[]
+    | .index as $idx
+    | [$idx,
+       (.["store.size"] // .store_size // 0),
+       (.["pri.store.size"] // .pri_store_size // 0),
+       ($ilm_data[$idx].policy // "unmanaged"),
+       ($ilm_data[$idx].phase // (if $ilm_data[$idx].managed // false then "managed-no-phase-yet" else "not managed" end))
+      ] | @tsv
 ' sizes.json \
-  | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES"; cat -) \
+  | sort -k2 -n -r \
+  | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
+
+echo ""
+echo "Legend / Notes:"
+echo "  STORE_BYTES     = total disk usage (primaries + replicas)"
+echo "  PRI_STORE_BYTES = primary shards only (raw data size)"
+echo "  ILM.POLICY      = 'unmanaged' means no lifecycle policy is attached"
+echo "  PHASE           = only shown if managed; common values: hot, warm, cold, frozen, delete"
+echo ""
+echo "If all indices show 'unmanaged' / 'not managed':"
+echo "  → They do not have an ILM policy attached (common for manually created indices)"
+echo "  → To attach one: PUT /your-index/_settings { \"index.lifecycle.name\": \"your-policy\" }"
+echo "  → Verify single index: GET your-index/_ilm/explain?pretty"
+echo ""
+echo "Cleanup temporary files? (y/N)"
+read -r cleanup
+if [[ "$cleanup" =~ ^[Yy]$ ]]; then
+  rm -f sizes.json ilm.json
+  echo "Files removed."
+fi
