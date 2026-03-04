@@ -1,14 +1,48 @@
-curl -s -X GET "localhost:9200/_cat/indices?format=json&h=index,store.size,pri.store.size&expand_wildcards=open" -u elastic:your_password \
-  | jq -r '.[] | [.index, .store_size, .pri_store_size] | @tsv' \
-  | while read -r idx total_size pri_size; do
-      phase_info=$(curl -s "localhost:9200/$idx/_ilm/explain?pretty" -u elastic:your_password \
-        | jq -r '.indices."'"$idx"'" | 
-          if .managed then 
-            [.policy // "none", .phase // "-"] | join("\t") 
-          else 
-            "unmanaged\t-" 
-          end')
-      echo -e "$idx\t$total_size\t$pri_size\t$phase_info"
+#!/usr/bin/env bash
+# Elasticsearch ILM + Indices Size Report (bytes, sorted by total size descending)
+# Prompts for credentials interactively
+
+set -euo pipefail
+
+# Prompt for credentials (only once)
+read -p "Elasticsearch username: " ES_USER
+read -s -p "Elasticsearch password: " ES_PASS
+echo ""  # newline after hidden password input
+
+# Base URL (change if not localhost:9200)
+ES_HOST="localhost:9200"
+
+# Step 1: Fetch ALL index sizes in bytes (numeric) once
+curl -s -u "${ES_USER}:${ES_PASS}" \
+  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open" > sizes.json
+
+# Quick check if we got data
+if ! jq -e '.[]' sizes.json >/dev/null 2>&1; then
+  echo "Error: No indices found or authentication failed. Check credentials/host."
+  echo "Raw response snippet:"
+  head -n 10 sizes.json
+  exit 1
+fi
+
+# Step 2: Process sizes + fetch ILM info, then sort by total bytes descending
+jq -r '.[] | [.index, .store_size // 0, .pri_store_size // 0] | @tsv' sizes.json \
+  | while read -r idx total_bytes pri_bytes; do
+      # Get ILM policy + phase for this index
+      phase_info=$(curl -s -u "${ES_USER}:${ES_PASS}" \
+        "http://${ES_HOST}/$idx/_ilm/explain?pretty" \
+        | jq -r --arg idx "$idx" '
+            (.indices[$idx] // {managed: false}) |
+            if .managed then
+              [.policy // "none", .phase // "-"] | join("\t")
+            else
+              "unmanaged\t-"
+            end')
+
+      echo -e "$idx\t$total_bytes\t$pri_bytes\t$phase_info"
     done \
-  | (echo -e "INDEX\tSTORE.SIZE\tPRI.STORE.SIZE\tILM.POLICY\tPHASE"; cat -) \
+  | sort -k2 -n -r \
+  | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
+
+# Optional: clean up temp file
+# rm -f sizes.json
