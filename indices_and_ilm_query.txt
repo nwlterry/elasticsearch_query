@@ -7,41 +7,53 @@ echo ""
 
 ES_HOST="localhost:9200"
 
+echo "Fetching index sizes..."
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open" > sizes.json
+  -o sizes.json \
+  "http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b&expand_wildcards=open"
 
-if [ ! -s sizes.json ] || ! grep -q "store_size" sizes.json; then
-  echo "Error: sizes.json is empty or missing store_size keys."
-  head -n 20 sizes.json
+if [ ! -s sizes.json ]; then
+  echo "ERROR: sizes.json is empty (0 bytes). Curl failed or returned nothing."
+  echo "Try running this manually and check for errors:"
+  echo "curl -u \"${ES_USER}:***\" \"http://${ES_HOST}/_cat/indices?format=json&h=index,store.size,pri.store.size&bytes=b\""
   exit 1
 fi
 
-# Use awk for more reliable tab-separated parsing
-cat sizes.json | jq -r '.[] | [.index, .store_size // 0, .pri_store_size // 0] | @tsv' \
-  | awk -F'\t' '{
-      idx = $1
-      total = $2
-      pri   = $3
+echo "sizes.json size: $(wc -c < sizes.json) bytes"
+echo "First 3 indices (raw):"
+jq '.[0:3]' sizes.json || echo "Not valid JSON – check auth/response"
 
-      # Fetch ILM (you can keep this part)
-      cmd = "curl -s -u \"${ES_USER}:${ES_PASS}\" \"http://${ES_HOST}/" idx "/_ilm/explain?pretty\""
-      cmd | getline ilm_json
-      close(cmd)
+# Try to detect which key style is used
+if grep -q '"store_size"' sizes.json; then
+  TOTAL_KEY="store_size"
+  PRI_KEY="pri_store_size"
+  echo "Detected snake_case keys (store_size / pri_store_size)"
+elif grep -q '"store.size"' sizes.json; then
+  TOTAL_KEY="store.size"
+  PRI_KEY="pri.store.size"
+  echo "Detected dot keys (store.size / pri.store.size)"
+else
+  echo "WARNING: No store size keys found in JSON – sizes will show as 0"
+  TOTAL_KEY="store_size"   # fallback, will be 0
+  PRI_KEY="pri_store_size"
+fi
 
-      phase_info = "unmanaged\t-"
-      if (ilm_json != "") {
-        # Very basic check – improve with jq if needed
-        if (index(ilm_json, "\"managed\": true") > 0) {
-          match(ilm_json, /"policy":\s*"([^"]+)"/, arr); policy = arr[1] ? arr[1] : "none"
-          match(ilm_json, /"phase":\s*"([^"]+)"/, arr2); phase = arr2[1] ? arr2[1] : "-"
-          phase_info = policy "\t" phase
-        }
-      }
+# Process with detected keys
+jq -r --arg t "$TOTAL_KEY" --arg p "$PRI_KEY" \
+  '.[] | [.index, (.[$t] // 0), (.[$p] // 0)] | @tsv' sizes.json \
+  | while read -r idx total_bytes pri_bytes; do
+      phase_info=$(curl -s -u "${ES_USER}:${ES_PASS}" \
+        "http://${ES_HOST}/$idx/_ilm/explain?pretty" \
+        | jq -r --arg idx "$idx" '
+            (.indices[$idx] // {managed:false}) |
+            if .managed then [.policy // "none", .phase // "-"] | join("\t")
+            else "unmanaged\t-" end')
 
-      print idx "\t" total "\t" pri "\t" phase_info
-    }' \
+      echo -e "$idx\t$total_bytes\t$pri_bytes\t$phase_info"
+    done \
   | sort -k2 -n -r \
   | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) \
   | column -t -s $'\t'
 
-# rm sizes.json   # uncomment to clean up
+# Optional cleanup
+# rm sizes.json
