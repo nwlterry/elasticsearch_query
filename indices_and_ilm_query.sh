@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - FINAL with in-use-by
+# Elasticsearch ILM Report + Policies Export - FINAL (with separated rollover & in-use-by)
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -13,7 +13,7 @@ echo -e "\n"
 
 # === Configuration ===
 ES_PROTO="http"                    # change to "https" if needed
-ES_HOST="localhost:9200"           # host + port only (no protocol)
+ES_HOST="localhost:9200"           # host + port only
 ES_URL="${ES_PROTO}://${ES_HOST}"
 
 echo "=== Connecting to: ${ES_URL} ==="
@@ -64,7 +64,7 @@ echo -e "\nIndex report complete."
 # ───────────────────────────────────────────────────────────────
 echo -e "\n=== ILM Policies Export ===\n"
 
-read -p "Export ILM policies (JSON + CSV with separated hot rollover + in-use-by)? (y/N): " export_choice
+read -p "Export ILM policies (JSON + CSV with separated rollover + in-use-by)? (y/N): " export_choice
 
 if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
@@ -89,7 +89,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
   echo "DEBUG: Found ${policy_count} policies"
 
-  # ────────────── Fetch usage info ──────────────
+  # ────────────── Fetch usage info (indices & data streams only) ──────────────
   echo "Collecting usage info (indices & data streams)..."
 
   curl -s -u "${ES_USER}:${ES_PASS}" \
@@ -98,7 +98,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_data_stream?pretty" > datastreams_usage.json
 
-  # ────────────── Focused CSV ──────────────
+  # ────────────── Focused CSV with separated rollover + usage ──────────────
   echo "Generating focused CSV..."
 
   jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json --slurpfile ds datastreams_usage.json '
@@ -109,18 +109,22 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | $pols | to_entries[]
     | .key as $name
     | .value // {}
-    | .policy.phases.hot.actions.rollover as $r
+    | .policy // {}
+    | .phases // {}
+    | .hot // {}
+    | .actions // {}
+    | .rollover // {}
     | {
         name: $name,
         version: (.version // "null"),
-        hot_max_age: ($r.max_age // "-"),
-        hot_max_size: ($r.max_size // "-"),
-        hot_max_primary_shard_size: ($r.max_primary_shard_size // "-"),
-        hot_max_docs: ($r.max_docs // "-"),
-        cold_min_age: (.policy.phases.cold.min_age // "-"),
-        cold_actions: (.policy.phases.cold.actions | keys | join(", ") // "-"),
-        delete_min_age: (.policy.phases.delete.min_age // "-"),
-        delete_actions: (.policy.phases.delete.actions | keys | join(", ") // "-"),
+        hot_max_age: (.max_age // "-"),
+        hot_max_size: (.max_size // "-"),
+        hot_max_primary_shard_size: (.max_primary_shard_size // "-"),
+        hot_max_docs: (.max_docs // "-"),
+        cold_min_age: (.cold.min_age // "-"),
+        cold_actions: (.cold.actions | keys | join(", ") // "-"),
+        delete_min_age: (.delete.min_age // "-"),
+        delete_actions: (.delete.actions | keys | join(", ") // "-"),
         indices_count: ($inds | map(select(.["ilm.policy"] == $name)) | length),
         indices_list: ($inds | map(select(.["ilm.policy"] == $name) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end),
         ds_count: ($dstreams | map(select(.ilm_policy == $name)) | length),
