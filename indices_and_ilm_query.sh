@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV) - 2026-03
+# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV) - FINAL
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -11,7 +11,7 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo -e "\n"
 
-ES_PROTO="http"
+ES_PROTO="http"                 # change to "https" if needed
 ES_HOST="${ES_PROTO}://localhost:9200"
 
 echo "=== Connecting to: ${ES_HOST} ==="
@@ -84,55 +84,64 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
   echo "DEBUG: Found $policy_count policies"
 
-  # ────────────── Generate CSV ──────────────
+  # ────────────── Generate Focused CSV ──────────────
   echo "Generating focused CSV..."
 
   if [ ! -f "${json_file}" ]; then
-    echo "ERROR: JSON file not found right before jq: ${json_file}"
-    ls -l ilm_policies_export_*.json 2>/dev/null || echo "(no export files found)"
+    echo "ERROR: JSON file disappeared before jq: ${json_file}"
+    ls -l ilm_policies_export_*.json 2>/dev/null || echo "(no export files)"
     exit 1
   fi
 
-  # Ultra-safe jq – avoid any deep chaining that can cause "null has no keys"
+  echo "DEBUG: Input file → ${json_file} ($(wc -c < "${json_file}") bytes)"
+
   jq -r '
     to_entries[]
-    | .key as $n
+    | .key as $name
     | .value // {}
     | [
-        $n,
+        $name,
         (.version // "null"),
-        (if .policy.phases.hot.actions.rollover then .policy.phases.hot.actions.rollover | tojson else "none" end // "none"),
-        (if .policy.phases.cold.min_age then .policy.phases.cold.min_age else "-" end // "-"),
-        (if .policy.phases.cold.actions then (.policy.phases.cold.actions | keys | join(", ")) else "-" end // "-"),
-        (if .policy.phases.delete.min_age then .policy.phases.delete.min_age else "-" end // "-"),
-        (if .policy.phases.delete.actions then (.policy.phases.delete.actions | keys | join(", ")) else "-" end // "-")
+        (if .policy.phases.hot.actions.rollover? then .policy.phases.hot.actions.rollover | tojson else "none" end),
+        (if .policy.phases.cold.min_age? then .policy.phases.cold.min_age else "-" end),
+        (if .policy.phases.cold.actions? then (.policy.phases.cold.actions | keys | join(", ")) else "-" end),
+        (if .policy.phases.delete.min_age? then .policy.phases.delete.min_age else "-" end),
+        (if .policy.phases.delete.actions? then (.policy.phases.delete.actions | keys | join(", ")) else "-" end)
       ] | @csv
   ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
 
+  # Show results
   if [ -s jq_err.log ]; then
-    echo "jq produced errors/warnings:"
+    echo "jq errors/warnings:"
     cat jq_err.log
+  else
+    echo "jq ran without stderr"
   fi
 
-  row_count=$(wc -l < "${csv_file}.tmp" 2>/dev/null || echo 0)
-  echo "DEBUG: CSV rows produced (excluding header): $row_count"
+  if [ -f "${csv_file}.tmp" ] && [ -s "${csv_file}.tmp" ]; then
+    echo "CSV temp file created with content:"
+    wc -l < "${csv_file}.tmp"
+    head -n 5 "${csv_file}.tmp"
+  else
+    echo "CSV temp file is missing or empty"
+    ls -l "${csv_file}.tmp" 2>/dev/null || echo "(file not created)"
+  fi
 
+  # Final CSV with header
   {
     echo "policy_name,version,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions"
-    cat "${csv_file}.tmp"
+    [ -f "${csv_file}.tmp" ] && cat "${csv_file}.tmp"
   } > "${csv_file}"
 
   rm -f "${csv_file}.tmp" jq_err.log
 
   if [ -f "${csv_file}" ] && [ -s "${csv_file}" ]; then
-    echo "CSV created successfully: ${csv_file}"
+    echo "Success! Focused CSV created: ${csv_file}"
+    echo "First few lines:"
     head -n 5 "${csv_file}"
   else
-    echo "WARNING: Focused CSV is empty or was not created"
-    echo "Possible reasons:"
-    echo "  - No policies have any of the requested fields"
-    echo "  - jq crashed due to very unusual policy structure"
-    echo "  - File permission issue"
+    echo "WARNING: Focused CSV is empty or failed to create"
+    echo "Check jq_err.log (if exists) and the JSON file content"
   fi
 else
   echo "Export skipped."
