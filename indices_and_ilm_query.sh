@@ -103,30 +103,19 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
 
   jq -r '
     to_entries[]
-    | .key as $name
-    | .value // {policy: null}
-    | .policy // {phases: {}}
-    | {
-        name: $name,
-        version: (.version // "null"),
-        modified: (.modified_date // "null"),
-        hot_rollover: (.phases.hot?.actions?.rollover | tojson // "none"),
-        cold_age: (.phases.cold?.min_age // "-"),
-        cold_actions: (.phases.cold?.actions | keys | join(", ") // "-"),
-        delete_age: (.phases.delete?.min_age // "-"),
-        delete_actions: (.phases.delete?.actions | keys | join(", ") // "-")
-      }
+    | .key as $n
+    | .value // {}
     | [
-        .name,
-        .version,
-        .modified,
-        .hot_rollover,
-        .cold_age,
-        .cold_actions,
-        .delete_age,
-        .delete_actions
+        $n,
+        (.version // "null"),
+        (.modified_date // "null"),
+        (if .policy?.phases?.hot?.actions?.rollover? then .policy.phases.hot.actions.rollover | tojson else "none" end),
+        (.policy?.phases?.cold?.min_age // "-"),
+        (if .policy?.phases?.cold?.actions? then (.policy.phases.cold.actions | keys | join(", ")) else "-" end),
+        (.policy?.phases?.delete?.min_age // "-"),
+        (if .policy?.phases?.delete?.actions? then (.policy.phases.delete.actions | keys | join(", ")) else "-" end)
       ] | @csv
-  ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
+  ' "$$   {json_file}" > "   $${csv_file}.tmp" 2> jq_err.log
 
   if [ -s jq_err.log ]; then
     echo "jq errors/warnings:"
