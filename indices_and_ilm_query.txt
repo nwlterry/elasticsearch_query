@@ -62,10 +62,11 @@ tail -n +2 report.tsv | sort -k2 -n -r | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE
 
 echo -e "\nIndex report complete."
 
-# ────────────────────────────────────────────────
-echo -e "\n=== ILM Policies Export Session ==="
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "\n=== ILM Policies Export (JSON + Focused CSV) ===\n"
 
-read -p "Export all ILM policies (JSON + focused CSV)? (y/N): " export_choice
+read -p "Export all ILM policies (JSON + focused CSV with usage)? (y/N): " export_choice
+
 if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "Fetching all ILM policies..."
 
@@ -94,34 +95,47 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   # ────────────── Focused CSV ──────────────
   echo "Generating focused CSV..."
 
-  if [ ! -f "${json_file}" ]; then
-    echo "ERROR: JSON file disappeared before CSV generation: ${json_file}"
+  if [ ! -f "${json_file}" ] || [ ! -s "${json_file}" ]; then
+    echo "ERROR: JSON file is missing or empty: ${json_file}"
     exit 1
   fi
 
-  jq -r --arg today "$(date +%Y-%m-%d)" '
-    to_entries[]
-    | .key as $name
-    | .value
-    | if . == null or .policy == null then
-        [$name, "null", "null", "none", "-", "-", "-", "-"]
-      else
-        [
-          $name,
-          (.version // "null"),
-          (.modified_date // "null"),
-          (.policy.phases.hot.actions.rollover | tojson // "none"),
-          (.policy.phases.cold.min_age // "-"),
-          (.policy.phases.cold.actions | keys | join(", ") // "-"),
-          (.policy.phases.delete.min_age // "-"),
-          (.policy.phases.delete.actions | keys | join(", ") // "-")
-        ]
-      end | @csv
-  ' "${json_file}" > "${csv_file}.tmp" 2> jq_error.log
+  echo "DEBUG: Input JSON has $(jq 'length' "${json_file}") policies"
 
-  if [ -s jq_error.log ]; then
-    echo "jq encountered errors during CSV generation:"
-    cat jq_error.log
+  jq -r '
+    if (. | length == 0) then
+      "DEBUG: No policies found in JSON (empty object)"
+    else
+      to_entries[]
+      | .key as $name
+      | .value
+      | if . == null or .policy == null then
+          [$name, "null", "null", "none", "-", "-", "-", "-"]
+        else
+          [
+            $name,
+            (.version // "null"),
+            (.modified_date // "null"),
+            (.policy.phases.hot.actions.rollover | tojson // "none"),
+            (.policy.phases.cold.min_age // "-"),
+            (.policy.phases.cold.actions | keys | join(", ") // "-"),
+            (.policy.phases.delete.min_age // "-"),
+            (.policy.phases.delete.actions | keys | join(", ") // "-")
+          ]
+        end | @csv
+    end
+  ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
+
+  if [ -s jq_err.log ]; then
+    echo "jq errors during CSV generation:"
+    cat jq_err.log
+  fi
+
+  if [ ! -s "${csv_file}.tmp" ]; then
+    echo "WARNING: No rows produced → likely no policies or all skipped"
+    echo "Check: jq 'length' ${json_file}"
+  else
+    echo "CSV rows produced: $(wc -l < "${csv_file}.tmp")"
   fi
 
   # Add header
@@ -130,65 +144,10 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     cat "${csv_file}.tmp"
   } > "${csv_file}"
 
-  rm -f "${csv_file}.tmp" jq_error.log
+  rm -f "${csv_file}.tmp" jq_err.log
 
   echo ""
   echo "Export complete:"
-  echo "  • Full JSON: ${json_file}"
-  echo "  • Focused CSV: ${csv_file}"
-else
-  echo "Export skipped."
-fi
-
-  # ────────────── Add usage information ──────────────
-  echo "Collecting usage info (indices + data streams)..."
-
-  curl -s -u "${ES_USER}:${ES_PASS}" \
-    "${ES_HOST}/_cat/indices?format=json&h=index,ilm.policy" > indices.json
-
-  curl -s -u "${ES_USER}:${ES_PASS}" \
-    "${ES_HOST}/_data_stream" > data_streams.json
-
-  jq -r --slurpfile policies "${json_file}" --slurpfile ind indices.json --slurpfile ds data_streams.json '
-    $policies[0] as $pols
-    | $ind[0] as $inds
-    | $ds[0].data_streams as $dstreams
-
-    | $pols | to_entries[]
-    | .key as $policy
-    | {
-        policy: $policy,
-        ind_count: ($inds | map(select(.["ilm.policy"] == $policy)) | length),
-        ind_list: ($inds | map(select(.["ilm.policy"] == $policy) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end),
-        ds_count: ($dstreams | map(select(.ilm_policy == $policy)) | length),
-        ds_list: ($dstreams | map(select(.ilm_policy == $policy) | .name) | join(", ") | if length > 200 then .[0:197]+"..." else . end)
-      }
-    | [
-        .policy,
-        ($pols[.policy].version // "null"),
-        ($pols[.policy].modified_date // "null"),
-        ($pols[.policy].policy.phases.hot.actions.rollover | tojson // "none"),
-        ($pols[.policy].policy.phases.cold.min_age // "-"),
-        ($pols[.policy].policy.phases.cold.actions | keys | join(", ") // "-"),
-        ($pols[.policy].policy.phases.delete.min_age // "-"),
-        ($pols[.policy].policy.phases.delete.actions | keys | join(", ") // "-"),
-        .ind_count,
-        .ds_count,
-        .ind_list,
-        .ds_list
-      ] | @csv
-  ' "${json_file}" > "${csv_file}"
-
-  # Final header + data
-  {
-    echo "policy_name,version,modified_date,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions,used_by_indices_count,used_by_data_streams_count,used_by_indices_list,used_by_data_streams_list"
-    cat "${csv_file}"
-  } > temp.csv && mv temp.csv "${csv_file}"
-
-  rm -f "${csv_file}.tmp" indices.json data_streams.json
-
-  echo ""
-  echo "Export finished:"
   echo "  • Full JSON:          ${json_file}"
   echo "  • Focused CSV:        ${csv_file}"
   echo ""
@@ -202,6 +161,6 @@ echo -e "\n=== Finished ===\n"
 
 read -p "Remove temporary files (y/N)? " cleanup
 if [[ "${cleanup,,}" =~ ^(y|yes)$ ]]; then
-  rm -f sizes.json report.tsv ilm_policies_export_* indices.json data_streams.json 2>/dev/null
+  rm -f sizes.json report.tsv ilm_policies_export_* 2>/dev/null
   echo "Temporary files removed."
 fi
