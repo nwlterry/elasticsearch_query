@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - FINAL (with separated rollover & in-use-by)
+# Elasticsearch ILM Report + Policies Export - FIXED (separate indices & data streams)
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -64,7 +64,7 @@ echo -e "\nIndex report complete."
 # ───────────────────────────────────────────────────────────────
 echo -e "\n=== ILM Policies Export ===\n"
 
-read -p "Export ILM policies (JSON + CSV with separated rollover + in-use-by)? (y/N): " export_choice
+read -p "Export ILM policies (JSON + CSV with separated rollover & usage)? (y/N): " export_choice
 
 if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
@@ -89,8 +89,8 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
   echo "DEBUG: Found ${policy_count} policies"
 
-  # ────────────── Fetch usage info (indices & data streams only) ──────────────
-  echo "Collecting usage info (indices & data streams)..."
+  # ────────────── Fetch usage info ──────────────
+  echo "Collecting usage info..."
 
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_cat/indices?format=json&h=index,ilm.policy" > indices_usage.json
@@ -98,7 +98,10 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_data_stream?pretty" > datastreams_usage.json
 
-  # ────────────── Focused CSV with separated rollover + usage ──────────────
+  echo "DEBUG: indices_usage.json size: $( [ -f indices_usage.json ] && wc -c < indices_usage.json || echo "0" ) bytes"
+  echo "DEBUG: datastreams_usage.json size: $( [ -f datastreams_usage.json ] && wc -c < datastreams_usage.json || echo "0" ) bytes"
+
+  # ────────────── Focused CSV ──────────────
   echo "Generating focused CSV..."
 
   jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json --slurpfile ds datastreams_usage.json '
@@ -111,13 +114,16 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | .value // {}
     | .policy // {}
     | .phases // {}
+    | .hot // {}
+    | .actions // {}
+    | .rollover // {}
     | {
         name: $name,
         version: (.version // "null"),
-        hot_max_age: (.hot.actions.rollover.max_age // "-"),
-        hot_max_size: (.hot.actions.rollover.max_size // "-"),
-        hot_max_primary_shard_size: (.hot.actions.rollover.max_primary_shard_size // "-"),
-        hot_max_docs: (.hot.actions.rollover.max_docs // "-"),
+        hot_max_age: (.max_age // "-"),
+        hot_max_size: (.max_size // "-"),
+        hot_max_primary_shard_size: (.max_primary_shard_size // "-"),
+        hot_max_docs: (.max_docs // "-"),
         cold_min_age: (.cold.min_age // "-"),
         cold_actions: (.cold.actions | if type == "object" then keys else [] end | join(", ") // "-"),
         delete_min_age: (.delete.min_age // "-"),
