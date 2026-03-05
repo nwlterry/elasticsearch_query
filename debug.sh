@@ -1,0 +1,1 @@
+jq -r 'to_entries[] | .key as $n | .value | select( .policy? | type != "object" or .phases? | type != "object" ) | $n + " → type of .policy: " + (.policy | type) + ", type of .phases: " + (.policy.phases | type)' ilm_policies_export_*.json
