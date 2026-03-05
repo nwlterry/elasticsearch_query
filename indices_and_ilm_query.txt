@@ -62,11 +62,10 @@ tail -n +2 report.tsv | sort -k2 -n -r | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE
 
 echo -e "\nIndex report complete."
 
-# ─────────────────────────────────────────────────────────────────────────────
-echo -e "\n=== ILM Policies Export (JSON + Focused CSV) ===\n"
+# ────────────────────────────────────────────────
+echo -e "\n=== ILM Policies Export Session ==="
 
-read -p "Export all ILM policies (JSON + focused CSV with usage)? (y/N): " export_choice
-
+read -p "Export all ILM policies (JSON + focused CSV)? (y/N): " export_choice
 if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "Fetching all ILM policies..."
 
@@ -74,14 +73,18 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   json_file="ilm_policies_export_${timestamp}.json"
   csv_file="ilm_policies_export_${timestamp}_focused.csv"
 
-  # Fetch policies
-  curl_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
+  echo "DEBUG: Will save policies to: $json_file"
+
+  policies_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
     -o "${json_file}" -w "%{http_code}" \
     "${ES_HOST}/_ilm/policy?pretty&human")
 
-  if [ "${curl_http}" -ne 200 ] || [ ! -s "${json_file}" ]; then
-    echo "ERROR: Failed to fetch policies (HTTP ${curl_http})"
-    head -n 10 "${json_file}" 2>/dev/null || echo "(empty)"
+  echo "DEBUG: Fetch HTTP status: $policies_http"
+  echo "DEBUG: File size after fetch: $( [ -f "$json_file" ] && wc -c < "$json_file" || echo "0" ) bytes"
+
+  if [ "${policies_http}" -ne 200 ] || [ ! -s "${json_file}" ]; then
+    echo "ERROR: Failed to fetch policies (HTTP ${policies_http})"
+    [ -f "${json_file}" ] && head -n 10 "${json_file}"
     exit 1
   fi
 
@@ -91,31 +94,51 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   # ────────────── Focused CSV ──────────────
   echo "Generating focused CSV..."
 
+  if [ ! -f "${json_file}" ]; then
+    echo "ERROR: JSON file disappeared before CSV generation: ${json_file}"
+    exit 1
+  fi
+
   jq -r --arg today "$(date +%Y-%m-%d)" '
     to_entries[]
     | .key as $name
     | .value
     | if . == null or .policy == null then
-      [$name, "null", "null", "none", "-", "-", "-", "-"]
-    else
-      [
-        $name,
-        (.version // "null"),
-        (.modified_date // "null"),
-        (.policy.phases.hot.actions.rollover | tojson // "none"),
-        (.policy.phases.cold.min_age // "-"),
-        (.policy.phases.cold.actions | keys | join(", ") // "-"),
-        (.policy.phases.delete.min_age // "-"),
-        (.policy.phases.delete.actions | keys | join(", ") // "-")
-      ]
-    end | @csv
-  ' "$$   {json_file}" > "   $${csv_file}.tmp"
+        [$name, "null", "null", "none", "-", "-", "-", "-"]
+      else
+        [
+          $name,
+          (.version // "null"),
+          (.modified_date // "null"),
+          (.policy.phases.hot.actions.rollover | tojson // "none"),
+          (.policy.phases.cold.min_age // "-"),
+          (.policy.phases.cold.actions | keys | join(", ") // "-"),
+          (.policy.phases.delete.min_age // "-"),
+          (.policy.phases.delete.actions | keys | join(", ") // "-")
+        ]
+      end | @csv
+  ' "${json_file}" > "${csv_file}.tmp" 2> jq_error.log
+
+  if [ -s jq_error.log ]; then
+    echo "jq encountered errors during CSV generation:"
+    cat jq_error.log
+  fi
 
   # Add header
   {
-    echo "policy_name,version,modified_date,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions,used_by_indices_count,used_by_data_streams_count,used_by_indices_list,used_by_data_streams_list"
-    tail -n +2 "${csv_file}.tmp"
-  } > temp.csv && mv temp.csv "${csv_file}.tmp"
+    echo "policy_name,version,modified_date,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions"
+    cat "${csv_file}.tmp"
+  } > "${csv_file}"
+
+  rm -f "${csv_file}.tmp" jq_error.log
+
+  echo ""
+  echo "Export complete:"
+  echo "  • Full JSON: ${json_file}"
+  echo "  • Focused CSV: ${csv_file}"
+else
+  echo "Export skipped."
+fi
 
   # ────────────── Add usage information ──────────────
   echo "Collecting usage info (indices + data streams)..."
