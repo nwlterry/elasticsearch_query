@@ -102,7 +102,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "Generating focused CSV..."
 
   jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json --slurpfile ds datastreams_usage.json '
-    $policies[0] as $pols
+  $policies[0] as $pols
     | $ind[0] as $inds
     | $ds[0].data_streams as $dstreams
 
@@ -122,13 +122,13 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
         hot_max_primary_shard_size: (.max_primary_shard_size // "-"),
         hot_max_docs: (.max_docs // "-"),
         cold_min_age: (.cold.min_age // "-"),
-        cold_actions: (.cold.actions | keys | join(", ") // "-"),
+        cold_actions: (.cold.actions | keys // [] | join(", ") // "-"),
         delete_min_age: (.delete.min_age // "-"),
-        delete_actions: (.delete.actions | keys | join(", ") // "-"),
+        delete_actions: (.delete.actions | keys // [] | join(", ") // "-"),
         indices_count: ($inds | map(select(.["ilm.policy"] == $name)) | length),
-        indices_list: ($inds | map(select(.["ilm.policy"] == $name) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end),
+        indices_list: ($inds | map(select(.["ilm.policy"] == $name) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end // "-"),
         ds_count: ($dstreams | map(select(.ilm_policy == $name)) | length),
-        ds_list: ($dstreams | map(select(.ilm_policy == $name) | .name) | join(", ") | if length > 200 then .[0:197]+"..." else . end)
+        ds_list: ($dstreams | map(select(.ilm_policy == $name) | .name) | join(", ") | if length > 200 then .[0:197]+"..." else . end // "-")
       }
     | [
         .name,
