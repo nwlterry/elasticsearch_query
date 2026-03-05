@@ -83,6 +83,17 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
   echo "DEBUG: Found $policy_count policies"
 
+  # Temporary minimal dump to see if ANY policy is readable
+  echo "DEBUG: Attempting minimal dump of first policy..."
+  jq 'to_entries[0] // "NO ENTRIES OR INVALID TOP LEVEL"' "${json_file}"
+
+  # Very minimal CSV – only names + version
+  echo "policy_name,version" > "${csv_file}.minimal.csv"
+  jq -r 'to_entries[] | [.key, (.value.version // "null")] | @csv' "${json_file}" >> "${csv_file}.minimal.csv" 2>/dev/null || echo "Minimal jq also failed"
+
+  echo "Minimal CSV created (only name + version): ${csv_file}.minimal.csv"
+  head -n 10 "${csv_file}.minimal.csv"
+
   # Show broken policies for diagnostics
   echo "DEBUG: Checking for broken/null policies..."
   jq -r 'to_entries[] | select(.value == null or .value.policy == null or .value.policy.phases == null) | .key + " (broken)"' "${json_file}" || echo "(none found)"
