@@ -2,9 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV)
-# - Index list with sizes & current ILM status
-# - Optional export of all ILM policies: full JSON + focused CSV
+# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV) - Robust v3
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -13,14 +11,12 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo -e "\n"
 
-# === Configuration ===
 ES_PROTO="http"                 # change to "https" if needed
 ES_HOST="${ES_PROTO}://localhost:9200"
-# Add -k to curl commands below if using self-signed HTTPS certificates
 
 echo "=== Connecting to: ${ES_HOST} ==="
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 echo -e "\n[1/2] Fetching index sizes..."
 
 sizes_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
@@ -37,7 +33,7 @@ fi
 
 echo "sizes.json size: $(wc -c < sizes.json) bytes"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 echo -e "\n[2/2] Building index + ILM report..."
 
 echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE" > report.tsv
@@ -57,82 +53,77 @@ while IFS=$'\t' read -r idx total pri; do
   echo -e "${idx}\t${total}\t${pri}\t${policy}\t${phase}" >> report.tsv
 done
 
-# Display sorted table
 tail -n +2 report.tsv | sort -k2 -n -r | (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE"; cat -) | column -t -s $'\t'
 
 echo -e "\nIndex report complete."
 
-# ─────────────────────────────────────────────────────────────────────────────
-echo -e "\n=== ILM Policies Export (JSON + Focused CSV) ===\n"
+# ───────────────────────────────────────────────────────────────
+echo -e "\n=== ILM Policies Export ===\n"
 
-read -p "Export all ILM policies (JSON + focused CSV with usage)? (y/N): " export_choice
+read -p "Export all ILM policies (JSON + focused CSV)? (y/N): " export_choice
 
 if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
-  echo "Fetching all ILM policies..."
-
   timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
   json_file="ilm_policies_export_${timestamp}.json"
   csv_file="ilm_policies_export_${timestamp}_focused.csv"
 
-  echo "DEBUG: Will save policies to: $json_file"
-
-  policies_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
+  echo "Fetching policies..."
+  curl_http=$(curl -s -u "${ES_USER}:${ES_PASS}" \
     -o "${json_file}" -w "%{http_code}" \
     "${ES_HOST}/_ilm/policy?pretty&human")
 
-  echo "DEBUG: Fetch HTTP status: $policies_http"
-  echo "DEBUG: File size after fetch: $( [ -f "$json_file" ] && wc -c < "$json_file" || echo "0" ) bytes"
+  echo "DEBUG: HTTP status: $curl_http"
+  echo "DEBUG: File size: $( [ -f "$json_file" ] && wc -c < "$json_file" || echo "0" ) bytes"
 
-  if [ "${policies_http}" -ne 200 ] || [ ! -s "${json_file}" ]; then
-    echo "ERROR: Failed to fetch policies (HTTP ${policies_http})"
-    [ -f "${json_file}" ] && head -n 10 "${json_file}"
+  if [ "$curl_http" -ne 200 ] || [ ! -s "$json_file" ]; then
+    echo "ERROR: Failed to fetch policies"
     exit 1
   fi
 
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
-  echo "Found ${policy_count} policies"
+  echo "DEBUG: Found $policy_count policies"
 
-  # ────────────── Focused CSV ──────────────
+  # Show broken policies for diagnostics
+  echo "DEBUG: Checking for broken/null policies..."
+  jq -r 'to_entries[] | select(.value == null or .value.policy == null or .value.policy.phases == null) | .key + " (broken)"' "${json_file}" || echo "(none found)"
+
+  # ────────────── Generate CSV ──────────────
   echo "Generating focused CSV..."
-
-  if [ ! -f "${json_file}" ] || [ ! -s "${json_file}" ]; then
-    echo "ERROR: JSON file is missing or empty: ${json_file}"
-    exit 1
-  fi
-
-  echo "DEBUG: Input JSON has $(jq 'length' "${json_file}") policies"
 
   jq -r '
     to_entries[]
     | .key as $name
-    | .value
-    | if (. == null or .policy == null) then
-        [$name, "null", "null", "none", "-", "-", "-", "-"]
-      else
-        [
-          $name,
-          (.version // "null"),
-          (.modified_date // "null"),
-          (.policy.phases?.hot?.actions?.rollover | tojson // "none"),
-          (.policy.phases?.cold?.min_age // "-"),
-          (.policy.phases?.cold?.actions | keys | join(", ") // "-"),
-          (.policy.phases?.delete?.min_age // "-"),
-          (.policy.phases?.delete?.actions | keys | join(", ") // "-")
-        ]
-      end | @csv
+    | .value // {policy: null}
+    | .policy // {phases: {}}
+    | {
+        name: $name,
+        version: (.version // "null"),
+        modified: (.modified_date // "null"),
+        hot_rollover: (.phases.hot?.actions?.rollover | tojson // "none"),
+        cold_age: (.phases.cold?.min_age // "-"),
+        cold_actions: (.phases.cold?.actions | keys | join(", ") // "-"),
+        delete_age: (.phases.delete?.min_age // "-"),
+        delete_actions: (.phases.delete?.actions | keys | join(", ") // "-")
+      }
+    | [
+        .name,
+        .version,
+        .modified,
+        .hot_rollover,
+        .cold_age,
+        .cold_actions,
+        .delete_age,
+        .delete_actions
+      ] | @csv
   ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
 
   if [ -s jq_err.log ]; then
-    echo "jq encountered warnings/errors during CSV generation:"
+    echo "jq errors/warnings:"
     cat jq_err.log
   fi
 
-  if [ ! -s "${csv_file}.tmp" ]; then
-    echo "WARNING: No rows produced in CSV (even though policies exist)"
-    echo "This may mean ALL policies are null/malformed"
-  else
-    echo "CSV rows produced: $(wc -l < "${csv_file}.tmp")"
-  fi
+  row_count=$(wc -l < "${csv_file}.tmp" 2>/dev/null || echo 0)
+  echo "DEBUG: CSV rows produced (excluding header): $row_count"
 
   # Add header
   {
@@ -144,15 +135,13 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
 
   echo ""
   echo "Export complete:"
-  echo "  • Full JSON:          ${json_file}"
-  echo "  • Focused CSV:        ${csv_file}"
-  echo ""
-  echo "Open ${csv_file} in Excel / Google Sheets"
+  echo "  • Full JSON: ${json_file}"
+  echo "  • Focused CSV: ${csv_file}"
 else
   echo "Export skipped."
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 echo -e "\n=== Finished ===\n"
 
 read -p "Remove temporary files (y/N)? " cleanup
