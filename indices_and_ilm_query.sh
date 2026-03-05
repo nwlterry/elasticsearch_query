@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV) - Robust v3
+# Elasticsearch ILM Report + Policies Export (JSON + Focused CSV) - 2026-03
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -11,7 +11,7 @@ read -p "Elasticsearch username: " ES_USER
 read -s -p "Elasticsearch password: " ES_PASS
 echo -e "\n"
 
-ES_PROTO="http"                 # change to "https" if needed
+ES_PROTO="http"
 ES_HOST="${ES_PROTO}://localhost:9200"
 
 echo "=== Connecting to: ${ES_HOST} ==="
@@ -27,7 +27,7 @@ echo "Sizes fetch HTTP status: ${sizes_http}"
 
 if [ "${sizes_http}" -ne 200 ] || [ ! -s sizes.json ]; then
   echo "ERROR: Failed to fetch index sizes (HTTP ${sizes_http})"
-  head -n 10 sizes.json 2>/dev/null || echo "(empty)"
+  [ -f sizes.json ] && head -n 10 sizes.json
   exit 1
 fi
 
@@ -40,14 +40,14 @@ echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE" > report.tsv
 
 jq -r '.[] | [.index, .["store.size"] // 0, .["pri.store.size"] // 0] | @tsv' sizes.json |
 while IFS=$'\t' read -r idx total pri; do
-  ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_HOST}/${idx}/_ilm/explain?human" 2>/dev/null)
+  ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_HOST}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
 
   if [[ -z "${ilm_resp}" ]]; then
     policy="unmanaged"
     phase="(fetch failed)"
   else
-    policy=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".policy // "unmanaged"')
-    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // (if .indices."'"${idx}"'".managed // false then "managed-no-phase" else "not managed" end)')
+    policy=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".policy // "unmanaged"' 2>/dev/null || echo "unmanaged")
+    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // (if .indices."'"${idx}"'".managed // false then "managed-no-phase" else "not managed" end)' 2>/dev/null || echo "not managed")
   fi
 
   echo -e "${idx}\t${total}\t${pri}\t${policy}\t${phase}" >> report.tsv
@@ -75,32 +75,25 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "DEBUG: HTTP status: $curl_http"
   echo "DEBUG: File size: $( [ -f "$json_file" ] && wc -c < "$json_file" || echo "0" ) bytes"
 
-  if [ "$curl_http" -ne 200 ] || [ ! -s "$json_file" ]; then
-    echo "ERROR: Failed to fetch policies"
+  if [ "$curl_http" -ne 200 ] || [ ! -f "$json_file" ] || [ ! -s "$json_file" ]; then
+    echo "ERROR: Failed to fetch policies (HTTP $curl_http)"
+    [ -f "$json_file" ] && head -n 10 "$json_file"
     exit 1
   fi
 
   policy_count=$(jq 'length' "${json_file}" 2>/dev/null || echo "0")
   echo "DEBUG: Found $policy_count policies"
 
-  # Temporary minimal dump to see if ANY policy is readable
-  echo "DEBUG: Attempting minimal dump of first policy..."
-  jq 'to_entries[0] // "NO ENTRIES OR INVALID TOP LEVEL"' "${json_file}"
-
-  # Very minimal CSV – only names + version
-  echo "policy_name,version" > "${csv_file}.minimal.csv"
-  jq -r 'to_entries[] | [.key, (.value.version // "null")] | @csv' "${json_file}" >> "${csv_file}.minimal.csv" 2>/dev/null || echo "Minimal jq also failed"
-
-  echo "Minimal CSV created (only name + version): ${csv_file}.minimal.csv"
-  head -n 10 "${csv_file}.minimal.csv"
-
-  # Show broken policies for diagnostics
-  echo "DEBUG: Checking for broken/null policies..."
-  jq -r 'to_entries[] | select(.value == null or .value.policy == null or .value.policy.phases == null) | .key + " (broken)"' "${json_file}" || echo "(none found)"
-
   # ────────────── Generate CSV ──────────────
   echo "Generating focused CSV..."
 
+  if [ ! -f "${json_file}" ]; then
+    echo "ERROR: JSON file not found right before jq: ${json_file}"
+    ls -l ilm_policies_export_*.json 2>/dev/null || echo "(no export files found)"
+    exit 1
+  fi
+
+  # Ultra-safe jq – avoid any deep chaining that can cause "null has no keys"
   jq -r '
     to_entries[]
     | .key as $n
@@ -108,35 +101,39 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | [
         $n,
         (.version // "null"),
-        (.modified_date // "null"),
-        (if .policy?.phases?.hot?.actions?.rollover? then .policy.phases.hot.actions.rollover | tojson else "none" end),
-        (.policy?.phases?.cold?.min_age // "-"),
-        (if .policy?.phases?.cold?.actions? then (.policy.phases.cold.actions | keys | join(", ")) else "-" end),
-        (.policy?.phases?.delete?.min_age // "-"),
-        (if .policy?.phases?.delete?.actions? then (.policy.phases.delete.actions | keys | join(", ")) else "-" end)
+        (if .policy.phases.hot.actions.rollover then .policy.phases.hot.actions.rollover | tojson else "none" end // "none"),
+        (if .policy.phases.cold.min_age then .policy.phases.cold.min_age else "-" end // "-"),
+        (if .policy.phases.cold.actions then (.policy.phases.cold.actions | keys | join(", ")) else "-" end // "-"),
+        (if .policy.phases.delete.min_age then .policy.phases.delete.min_age else "-" end // "-"),
+        (if .policy.phases.delete.actions then (.policy.phases.delete.actions | keys | join(", ")) else "-" end // "-")
       ] | @csv
-  ' "$$   {json_file}" > "   $${csv_file}.tmp" 2> jq_err.log
+  ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
 
   if [ -s jq_err.log ]; then
-    echo "jq errors/warnings:"
+    echo "jq produced errors/warnings:"
     cat jq_err.log
   fi
 
   row_count=$(wc -l < "${csv_file}.tmp" 2>/dev/null || echo 0)
   echo "DEBUG: CSV rows produced (excluding header): $row_count"
 
-  # Add header
   {
-    echo "policy_name,version,modified_date,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions"
+    echo "policy_name,version,hot_rollover_conditions,cold_phase_min_age,cold_phase_actions,delete_phase_min_age,delete_phase_actions"
     cat "${csv_file}.tmp"
   } > "${csv_file}"
 
   rm -f "${csv_file}.tmp" jq_err.log
 
-  echo ""
-  echo "Export complete:"
-  echo "  • Full JSON: ${json_file}"
-  echo "  • Focused CSV: ${csv_file}"
+  if [ -f "${csv_file}" ] && [ -s "${csv_file}" ]; then
+    echo "CSV created successfully: ${csv_file}"
+    head -n 5 "${csv_file}"
+  else
+    echo "WARNING: Focused CSV is empty or was not created"
+    echo "Possible reasons:"
+    echo "  - No policies have any of the requested fields"
+    echo "  - jq crashed due to very unusual policy structure"
+    echo "  - File permission issue"
+  fi
 else
   echo "Export skipped."
 fi
