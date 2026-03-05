@@ -103,37 +103,33 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   echo "DEBUG: Input JSON has $(jq 'length' "${json_file}") policies"
 
   jq -r '
-    if (. | length == 0) then
-      "DEBUG: No policies found in JSON (empty object)"
-    else
-      to_entries[]
-      | .key as $name
-      | .value
-      | if . == null or .policy == null then
-          [$name, "null", "null", "none", "-", "-", "-", "-"]
-        else
-          [
-            $name,
-            (.version // "null"),
-            (.modified_date // "null"),
-            (.policy.phases.hot.actions.rollover | tojson // "none"),
-            (.policy.phases.cold.min_age // "-"),
-            (.policy.phases.cold.actions | keys | join(", ") // "-"),
-            (.policy.phases.delete.min_age // "-"),
-            (.policy.phases.delete.actions | keys | join(", ") // "-")
-          ]
-        end | @csv
-    end
+    to_entries[]
+    | .key as $name
+    | .value
+    | if (. == null or .policy == null) then
+        [$name, "null", "null", "none", "-", "-", "-", "-"]
+      else
+        [
+          $name,
+          (.version // "null"),
+          (.modified_date // "null"),
+          (.policy.phases?.hot?.actions?.rollover | tojson // "none"),
+          (.policy.phases?.cold?.min_age // "-"),
+          (.policy.phases?.cold?.actions | keys | join(", ") // "-"),
+          (.policy.phases?.delete?.min_age // "-"),
+          (.policy.phases?.delete?.actions | keys | join(", ") // "-")
+        ]
+      end | @csv
   ' "${json_file}" > "${csv_file}.tmp" 2> jq_err.log
 
   if [ -s jq_err.log ]; then
-    echo "jq errors during CSV generation:"
+    echo "jq encountered warnings/errors during CSV generation:"
     cat jq_err.log
   fi
 
   if [ ! -s "${csv_file}.tmp" ]; then
-    echo "WARNING: No rows produced → likely no policies or all skipped"
-    echo "Check: jq 'length' ${json_file}"
+    echo "WARNING: No rows produced in CSV (even though policies exist)"
+    echo "This may mean ALL policies are null/malformed"
   else
     echo "CSV rows produced: $(wc -l < "${csv_file}.tmp")"
   fi
