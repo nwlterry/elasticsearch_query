@@ -91,11 +91,14 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   # ────────────── Focused CSV ──────────────
   echo "Generating focused CSV..."
 
-  jq -r --argjson today "$(date +%Y-%m-%d)" '
+  jq -r --arg today "$(date +%Y-%m-%d)" '
     to_entries[]
     | .key as $name
     | .value
-    | [
+    | if . == null or .policy == null then
+      [$name, "null", "null", "none", "-", "-", "-", "-"]
+    else
+      [
         $name,
         (.version // "null"),
         (.modified_date // "null"),
@@ -104,8 +107,9 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
         (.policy.phases.cold.actions | keys | join(", ") // "-"),
         (.policy.phases.delete.min_age // "-"),
         (.policy.phases.delete.actions | keys | join(", ") // "-")
-      ] | @csv
-  ' "${json_file}" > "${csv_file}.tmp"
+      ]
+    end | @csv
+  ' "$$   {json_file}" > "   $${csv_file}.tmp"
 
   # Add header
   {
