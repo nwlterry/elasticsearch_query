@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - UPDATED
+# Elasticsearch ILM Report + Policies Export - UPDATED & FIXED
 # - Sizes in raw bytes
 # - Only indices in report (no data stream rows)
-# - BACKING_DATA_STREAM column (shows owning data stream name or "-")
+# - BACKING_DATA_STREAM column (shows owning DS name or "-")
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -42,7 +42,7 @@ curl -s -u "${ES_USER}:${ES_PASS}" \
   "${ES_URL}/_data_stream?pretty" > "${ds_file}"
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nBuilding report (only indices + backing data stream name)..."
+echo -e "\nBuilding report (only indices + backing data stream)..."
 
 report_file="report.tsv"
 
@@ -57,14 +57,14 @@ jq -r '.[] | [
     (.["ilm.policy"] // "unmanaged")
   ] | @tsv' "${indices_file}" |
 while IFS=$'\t' read -r idx store pri policy; do
-  # Get accurate phase
+  # Get accurate phase from _ilm/explain
   phase="not managed"
   ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
   if [[ -n "${ilm_resp}" ]]; then
     phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
   fi
 
-  # Find backing data stream
+  # Find backing data stream (exact match on .indices array)
   backing_ds=$(jq -r --arg idx "$idx" '
     .data_streams[]
     | select(.indices // [] | index($idx))
