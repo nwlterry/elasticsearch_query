@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - UPDATED & FIXED
+# Elasticsearch ILM Report + Policies Export - UPDATED
 # - Sizes in raw bytes
-# - Only indices in report (no data stream rows)
-# - BACKING_DATA_STREAM column (shows owning DS name or "-")
+# - Only indices in report
+# - BACKING_DATA_STREAM from _cat/indices (no separate _data_stream call)
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -21,11 +21,11 @@ ES_URL="${ES_PROTO}://${ES_HOST}"
 echo "=== Connecting to: ${ES_URL} ==="
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nFetching indices with sizes (raw bytes) and ILM info..."
+echo -e "\nFetching all indices with sizes (bytes), ILM, and data stream info..."
 
 indices_file="indices.json"
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy&bytes=b" > "${indices_file}"
+  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy,ilm.phase,data_stream&bytes=b" > "${indices_file}"
 
 if [ ! -s "${indices_file}" ]; then
   echo "ERROR: Failed to fetch indices"
@@ -35,14 +35,7 @@ fi
 echo "indices.json size: $(wc -c < "${indices_file}") bytes"
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nFetching data streams (for backing lookup)..."
-
-ds_file="datastreams.json"
-curl -s -u "${ES_USER}:${ES_PASS}" \
-  "${ES_URL}/_data_stream?pretty" > "${ds_file}"
-
-# ───────────────────────────────────────────────────────────────
-echo -e "\nBuilding report (only indices + backing data stream)..."
+echo -e "\nBuilding report (only indices)..."
 
 report_file="report.tsv"
 
@@ -54,27 +47,10 @@ jq -r '.[] | [
     .index,
     (.["store.size"] // 0),
     (.["pri.store.size"] // 0),
-    (.["ilm.policy"] // "unmanaged")
-  ] | @tsv' "${indices_file}" |
-while IFS=$'\t' read -r idx store pri policy; do
-  # Get accurate phase from _ilm/explain
-  phase="not managed"
-  ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
-  if [[ -n "${ilm_resp}" ]]; then
-    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
-  fi
-
-  # Find backing data stream (exact match on .indices array)
-  backing_ds=$(jq -r --arg idx "$idx" '
-    .data_streams[]
-    | select(.indices // [] | index($idx))
-    | .name
-  ' "${ds_file}" | head -n 1)
-
-  [[ -z "$backing_ds" ]] && backing_ds="-"
-
-  echo -e "$idx\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}"
-done
+    (.["ilm.policy"] // "unmanaged"),
+    (.["ilm.phase"] // "not managed"),
+    (.["data_stream"] // "-")
+  ] | @tsv' "${indices_file}" >> "${report_file}"
 
 # Display final table
 echo -e "\n=== FINAL REPORT (only indices) ==="
@@ -102,20 +78,16 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
 
   echo "DEBUG: Policies JSON size: $(wc -c < "${json_file}") bytes"
 
-  # Usage info
+  # Usage info (indices only - data streams usage removed since not needed)
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_cat/indices?format=json&h=index,ilm.policy" > indices_usage.json
 
-  curl -s -u "${ES_USER}:${ES_PASS}" \
-    "${ES_URL}/_data_stream?pretty" > datastreams_usage.json
-
-  # Generate CSV
+  # Generate CSV (only indices usage)
   echo "Generating focused CSV..."
 
-  jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json --slurpfile ds datastreams_usage.json '
+  jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json '
     $policies[0] as $pols
     | $ind[0] as $inds
-    | $ds[0].data_streams as $dstreams
 
     | $pols | to_entries[]
     | .key as $name
@@ -137,9 +109,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
         delete_min_age: (.delete.min_age // "-"),
         delete_actions: (.delete.actions | if type == "object" then keys else [] end | join(", ") // "-"),
         indices_count: ($inds | map(select(.["ilm.policy"] == $name)) | length),
-        indices_list: ($inds | map(select(.["ilm.policy"] == $name) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end // "-"),
-        ds_count: ($dstreams | map(select(.ilm_policy == $name)) | length),
-        ds_list: ($dstreams | map(select(.ilm_policy == $name) | .name) | join(", ") | if length > 200 then .[0:197]+"..." else . end // "-")
+        indices_list: ($inds | map(select(.["ilm.policy"] == $name) | .index) | join(", ") | if length > 200 then .[0:197]+"..." else . end // "-")
       }
     | [
         .name,
@@ -153,9 +123,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
         .delete_min_age,
         .delete_actions,
         .indices_count,
-        .ds_count,
-        .indices_list,
-        .ds_list
+        .indices_list
       ] | @csv
   ' "${json_file}" > "${tmp_file}" 2> jq_err.log
 
@@ -165,11 +133,11 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   fi
 
   {
-    echo "policy_name,version,hot_max_age,hot_max_size,hot_max_primary_shard_size,hot_max_docs,cold_min_age,cold_actions,delete_min_age,delete_actions,used_by_indices_count,used_by_data_streams_count,used_by_indices_list,used_by_data_streams_list"
+    echo "policy_name,version,hot_max_age,hot_max_size,hot_max_primary_shard_size,hot_max_docs,cold_min_age,cold_actions,delete_min_age,delete_actions,used_by_indices_count,used_by_indices_list"
     [ -f "${tmp_file}" ] && cat "${tmp_file}"
   } > "${csv_file}"
 
-  rm -f "${tmp_file}" jq_err.log indices_usage.json datastreams_usage.json
+  rm -f "${tmp_file}" jq_err.log indices_usage.json
 
   if [ -f "${csv_file}" ] && [ -s "${csv_file}" ]; then
     echo "Success! Focused CSV created: ${csv_file}"
@@ -186,6 +154,6 @@ echo -e "\n=== Finished ===\n"
 
 read -p "Remove temporary files (y/N)? " cleanup
 if [[ "${cleanup,,}" =~ ^(y|yes)$ ]]; then
-  rm -f sizes.json report.tsv ilm_policies_export_* indices.json datastreams.json 2>/dev/null
+  rm -f "${indices_file}" "${report_file}" "${json_file}" "${csv_file}" 2>/dev/null
   echo "Temporary files removed."
 fi
