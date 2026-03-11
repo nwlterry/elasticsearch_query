@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - FIXED & UPDATED
+# Elasticsearch ILM Report + Policies Export - FIXED ILM & Phase
 # - Sizes in raw bytes
 # - Only indices in report
-# - BACKING_DATA_STREAM inferred from index name pattern (no _data_stream call)
+# - Accurate ILM policy & phase from _ilm/explain
+# - BACKING_DATA_STREAM from _cat/indices data_stream field
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -21,14 +22,22 @@ ES_URL="${ES_PROTO}://${ES_HOST}"
 echo "=== Connecting to: ${ES_URL} ==="
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nFetching indices with sizes (raw bytes) and ILM info..."
+echo -e "\nFetching basic indices list with sizes and data_stream field..."
 
 indices_file="indices.json"
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy,ilm.phase&bytes=b" > "${indices_file}"
+  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,data_stream&bytes=b" > "${indices_file}"
 
 if [ ! -s "${indices_file}" ]; then
-  echo "ERROR: Failed to fetch indices"
+  echo "ERROR: Failed to fetch indices (empty file)"
+  exit 1
+fi
+
+jq_type=$(jq type "${indices_file}" 2>/dev/null || echo "invalid")
+if [ "${jq_type}" != '"array"' ]; then
+  echo "ERROR: Response is not a JSON array (type = ${jq_type})"
+  echo "First 300 chars:"
+  head -c 300 "${indices_file}" | cat -v
   exit 1
 fi
 
@@ -46,22 +55,22 @@ jq -r '.[] | [
     .index,
     (.["store.size"] // 0),
     (.["pri.store.size"] // 0),
-    (.["ilm.policy"] // "unmanaged"),
-    (.["ilm.phase"] // "not managed")
+    (.["data_stream"] // "-")
   ] | @tsv' "${indices_file}" |
-while IFS=$'\t' read -r idx store pri policy phase; do
-  # Infer backing data stream from name pattern (common patterns)
-  backing_ds="-"
+while IFS=$'\t' read -r idx store pri ds; do
+  # Default
+  policy="unmanaged"
+  phase="not managed"
 
-  if [[ "$idx" == .ds-* ]]; then
-    # Strip .ds- prefix and date suffix (common pattern: .ds-logs-prod-2026.03.11-000001)
-    backing_ds=$(echo "$idx" | sed 's/^\.ds-//; s/-[0-9]\{4\}\.[0-9]\{2\}\.[0-9]\{2\}-[0-9]\+$//')
-  elif [[ "$idx" == logs-* || "$idx" == metrics-* || "$idx" == traces-* || "$idx" == audit-* ]]; then
-    # Assume prefix is the DS name (common in Elastic integrations)
-    backing_ds=$(echo "$idx" | cut -d'-' -f1-2)  # e.g. logs-prod
+  # Get accurate ILM policy & phase from _ilm/explain
+  ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
+
+  if [[ -n "${ilm_resp}" ]]; then
+    policy=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".policy // "unmanaged"' 2>/dev/null || echo "unmanaged")
+    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
   fi
 
-  echo -e "$idx\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}"
+  echo -e "$idx\t$store\t$pri\t$policy\t$phase\t${ds:--}" >> "${report_file}"
 done
 
 # Display final table
@@ -94,7 +103,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_cat/indices?format=json&h=index,ilm.policy" > indices_usage.json
 
-  # Generate CSV (indices only)
+  # Generate CSV
   echo "Generating focused CSV..."
 
   jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json '
