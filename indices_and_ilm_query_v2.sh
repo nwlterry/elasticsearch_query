@@ -46,26 +46,26 @@ jq -r '.[] | [
     .index,
     (.["store.size"] // 0),
     (.["pri.store.size"] // 0),
-    (.["ilm.policy"] // "unmanaged")
+    "-placeholder-"   # temp placeholder for policy (will be replaced)
   ] | @tsv' "${indices_file}" |
-while IFS=$'\t' read -r idx store pri policy; do
-  # Get accurate phase
+while IFS=$'\t' read -r idx store pri placeholder; do
+  # Get accurate ILM policy & phase from _ilm/explain
+  policy="unmanaged"
   phase="not managed"
+
   ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
+
   if [[ -n "${ilm_resp}" ]]; then
+    policy=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".policy // "unmanaged"' 2>/dev/null || echo "unmanaged")
     phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
   fi
 
-  # Infer data stream name from index name pattern
-  backing_ds="-"
+  # Get BACKING_DATA_STREAM from _cat/indices data_stream field
+  backing_ds=$(jq -r --arg idx "$idx" '
+    .[] | select(.index == $idx) | .data_stream // "-"
+  ' "${indices_file}" | head -n 1)
 
-  if [[ "$idx" == .ds-* ]]; then
-    # Common pattern: .ds-logs-prod-2026.03.11-000001
-    backing_ds=$(echo "$idx" | sed 's/^\.ds-//; s/-[0-9]\{4\}\.[0-9]\{2\}\.[0-9]\{2\}-[0-9]\+$//')
-  elif [[ "$idx" =~ ^(logs|metrics|traces|audit|synthetics|security|fleet)- ]]; then
-    # Elastic common prefixes - take first two parts as DS name
-    backing_ds=$(echo "$idx" | cut -d'-' -f1-2)
-  fi
+  [[ -z "$backing_ds" || "$backing_ds" == "null" ]] && backing_ds="-"
 
   echo -e "$idx\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}"
 done
