@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - FIXED VERSION
-# - Only indices in report
-# - Correct sizes, phase, and BACKING_DATA_STREAM
+# Elasticsearch ILM Report + Policies Export - UPDATED
+# - Sizes in raw bytes
+# - Only indices in report (no data stream rows)
+# - BACKING_DATA_STREAM column (shows owning data stream name or "-")
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -20,45 +21,53 @@ ES_URL="${ES_PROTO}://${ES_HOST}"
 echo "=== Connecting to: ${ES_URL} ==="
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nFetching indices with sizes and ILM info..."
+echo -e "\nFetching indices with sizes (raw bytes) and ILM info..."
 
 indices_file="indices.json"
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy" > "${indices_file}"
+  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy&bytes=b" > "${indices_file}"
 
 if [ ! -s "${indices_file}" ]; then
   echo "ERROR: Failed to fetch indices"
   exit 1
 fi
 
-echo -e "\nFetching data streams for backing info..."
+echo "indices.json size: $(wc -c < "${indices_file}") bytes"
+
+# ───────────────────────────────────────────────────────────────
+echo -e "\nFetching data streams (for backing lookup)..."
 
 ds_file="datastreams.json"
 curl -s -u "${ES_USER}:${ES_PASS}" \
   "${ES_URL}/_data_stream?pretty" > "${ds_file}"
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\nBuilding report (only indices + backing data stream)..."
+echo -e "\nBuilding report (only indices + backing data stream name)..."
 
 report_file="report.tsv"
 
 # Header
 echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE\tBACKING_DATA_STREAM" > "${report_file}"
 
-# Process every index
-jq -r '.[] | [.index, .["store.size"] // "-", .["pri.store.size"] // "-", (.["ilm.policy"] // "unmanaged") ] | @tsv' "${indices_file}" |
+# Process indices
+jq -r '.[] | [
+    .index,
+    (.["store.size"] // 0),
+    (.["pri.store.size"] // 0),
+    (.["ilm.policy"] // "unmanaged")
+  ] | @tsv' "${indices_file}" |
 while IFS=$'\t' read -r idx store pri policy; do
-  # Get accurate phase from _ilm/explain
+  # Get accurate phase
   phase="not managed"
   ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
   if [[ -n "${ilm_resp}" ]]; then
     phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
   fi
 
-  # Find backing data stream (exact membership check)
+  # Find backing data stream
   backing_ds=$(jq -r --arg idx "$idx" '
     .data_streams[]
-    | select(.indices[]? == $idx)
+    | select(.indices // [] | index($idx))
     | .name
   ' "${ds_file}" | head -n 1)
 
@@ -67,8 +76,8 @@ while IFS=$'\t' read -r idx store pri policy; do
   echo -e "$idx\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}"
 done
 
-# Display nice table
-echo -e "\n=== FINAL REPORT (indices only) ==="
+# Display final table
+echo -e "\n=== FINAL REPORT (only indices) ==="
 tail -n +2 "${report_file}" | sort -k1 | \
   (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE\tBACKING_DATA_STREAM"; cat -) | \
   column -t -s $'\t'
@@ -100,11 +109,14 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
   curl -s -u "${ES_USER}:${ES_PASS}" \
     "${ES_URL}/_data_stream?pretty" > datastreams_usage.json
 
+  # Generate CSV
   echo "Generating focused CSV..."
+
   jq -r --slurpfile policies "${json_file}" --slurpfile ind indices_usage.json --slurpfile ds datastreams_usage.json '
     $policies[0] as $pols
     | $ind[0] as $inds
     | $ds[0].data_streams as $dstreams
+
     | $pols | to_entries[]
     | .key as $name
     | .value // {}
