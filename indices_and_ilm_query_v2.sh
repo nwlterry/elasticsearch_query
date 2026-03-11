@@ -57,12 +57,12 @@ jq -r '.[] | [
     "-"   # placeholder for backing DS - filled later
   ] | @tsv' "${indices_file}" >> "${report_file}"
 
+
 # ───────────────────────────────────────────────────────────────
 echo "Matching indices to data streams..."
 
-# Create a map of data stream → backing indices pattern (simplified)
-# We check if index name matches any data stream backing index pattern
-# (real matching requires parsing .indices in _data_stream, but for simplicity we use name prefix match)
+# Create temp report with backing DS info
+cp "${report_file}" "${report_file}.tmp"
 
 while IFS=$'\t' read -r idx type store pri policy phase ds_placeholder; do
   # Skip header
@@ -70,18 +70,21 @@ while IFS=$'\t' read -r idx type store pri policy phase ds_placeholder; do
 
   backing_ds="-"
 
-  # Try to find if this index belongs to any data stream
-  # (simple prefix match - adjust if your DS patterns are different)
-  jq -r --arg idx "$idx" '
+  # Find if this index belongs to any data stream (safe against null/missing .indices)
+  ds_name=$(jq -r --arg idx "$idx" '
     .data_streams[]
-    | select(.indices[]? | startswith($idx) or ($idx | startswith(.)))
-    | .name
-  ' "${ds_file}" | while read -r ds_name; do
-    backing_ds="$ds_name"
-    break  # take first match (most common case)
-  done
+    | .indices // [] 
+    | .[]? 
+    | select(type == "string" and (startswith($idx) or ($idx | startswith(.))))
+    | .name // "-"
+  ' "${ds_file}" | head -n 1)
 
-  echo -e "$idx\t$type\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}.tmp"
+  if [[ -n "$ds_name" && "$ds_name" != "-" ]]; then
+    backing_ds="$ds_name"
+  fi
+
+  # Replace the line in temp file
+  sed -i "s/^${idx}\t.*/${idx}\t${type}\t${store}\t${pri}\t${policy}\t${phase}\t${backing_ds}/" "${report_file}.tmp"
 done < "${report_file}"
 
 mv "${report_file}.tmp" "${report_file}"
