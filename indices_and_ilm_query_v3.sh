@@ -105,28 +105,40 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     exit 1
   fi
 
-  # ────────────── CSV with all phases ──────────────
+  # ────────────── Generate CSV with all phases ──────────────
   echo "Generating CSV with all phases (no usage info)..."
 
   jq -r '
     to_entries[]
     | .key as $name
     | .value // {}
-    | .policy // {}
-    | .phases // {}
+    | {
+        name: $name,
+        version: (.version // "null"),
+        hot_min_age: (.policy.phases.hot.min_age // "-"),
+        hot_actions: (.policy.phases.hot.actions | if type == "object" then keys else [] end | join(", ") // "-"),
+        warm_min_age: (.policy.phases.warm.min_age // "-"),
+        warm_actions: (.policy.phases.warm.actions | if type == "object" then keys else [] end | join(", ") // "-"),
+        cold_min_age: (.policy.phases.cold.min_age // "-"),
+        cold_actions: (.policy.phases.cold.actions | if type == "object" then keys else [] end | join(", ") // "-"),
+        frozen_min_age: (.policy.phases.frozen.min_age // "-"),
+        frozen_actions: (.policy.phases.frozen.actions | if type == "object" then keys else [] end | join(", ") // "-"),
+        delete_min_age: (.policy.phases.delete.min_age // "-"),
+        delete_actions: (.policy.phases.delete.actions | if type == "object" then keys else [] end | join(", ") // "-")
+      }
     | [
-        $name,
-        (.version // "null"),
-        (.hot.min_age // "-"),
-        (.hot.actions | keys | join(", ") // "-"),
-        (.warm.min_age // "-"),
-        (.warm.actions | keys | join(", ") // "-"),
-        (.cold.min_age // "-"),
-        (.cold.actions | keys | join(", ") // "-"),
-        (.frozen.min_age // "-"),
-        (.frozen.actions | keys | join(", ") // "-"),
-        (.delete.min_age // "-"),
-        (.delete.actions | keys | join(", ") // "-")
+        .name,
+        .version,
+        .hot_min_age,
+        .hot_actions,
+        .warm_min_age,
+        .warm_actions,
+        .cold_min_age,
+        .cold_actions,
+        .frozen_min_age,
+        .frozen_actions,
+        .delete_min_age,
+        .delete_actions
       ] | @csv
   ' "${json_file}" > "${tmp_file}" 2> jq_err.log
 
