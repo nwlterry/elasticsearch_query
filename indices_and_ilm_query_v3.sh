@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# Elasticsearch ILM Report + Policies Export - UPDATED (CSV with all phases)
+# Elasticsearch ILM Report + Policies Export - FIXED BACKING_DATA_STREAM
+# - Sizes in raw bytes
+# - Only indices in report
+# - BACKING_DATA_STREAM inferred from index name pattern (no _data_stream call)
 # =============================================================================
 
 echo "Script started at $(date)"
@@ -18,45 +21,61 @@ ES_URL="${ES_PROTO}://${ES_HOST}"
 echo "=== Connecting to: ${ES_URL} ==="
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\n[1/2] Fetching index sizes (raw bytes) and ILM info..."
+echo -e "\nFetching indices with sizes (raw bytes) and ILM info..."
 
-sizes_file="sizes.json"
+indices_file="indices.json"
 curl -s -u "${ES_USER}:${ES_PASS}" \
-  -o "${sizes_file}" -w "%{http_code}" \
-  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy,ilm.phase&bytes=b" > "${sizes_file}"
+  "${ES_URL}/_cat/indices?format=json&h=index,store.size,pri.store.size,ilm.policy&bytes=b" > "${indices_file}"
 
-if [ ! -s "${sizes_file}" ]; then
+if [ ! -s "${indices_file}" ]; then
   echo "ERROR: Failed to fetch indices"
   exit 1
 fi
 
-echo "sizes.json size: $(wc -c < "${sizes_file}") bytes"
+echo "indices.json size: $(wc -c < "${indices_file}") bytes"
 
 # ───────────────────────────────────────────────────────────────
-echo -e "\n[2/2] Building index report..."
+echo -e "\nBuilding report (only indices)..."
 
 report_file="report.tsv"
 
+# Header
 echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE\tBACKING_DATA_STREAM" > "${report_file}"
 
 jq -r '.[] | [
     .index,
     (.["store.size"] // 0),
     (.["pri.store.size"] // 0),
-    (.["ilm.policy"] // "unmanaged"),
-    (.["ilm.phase"] // "not managed"),
-    "-"   # BACKING_DATA_STREAM placeholder
-  ] | @tsv' "${sizes_file}" |
-while IFS=$'\t' read -r idx store pri policy phase ds_placeholder; do
-  # Get accurate phase (already from _cat, but can be overridden if needed)
+    (.["ilm.policy"] // "unmanaged")
+  ] | @tsv' "${indices_file}" |
+while IFS=$'\t' read -r idx store pri policy; do
+  # Get accurate phase from _ilm/explain
+  phase="not managed"
   ilm_resp=$(curl -s -u "${ES_USER}:${ES_PASS}" "${ES_URL}/${idx}/_ilm/explain?human" 2>/dev/null || echo "")
   if [[ -n "${ilm_resp}" ]]; then
-    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "'"${phase}"'"' 2>/dev/null || echo "${phase}")
+    policy=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".policy // "unmanaged"' 2>/dev/null || echo "unmanaged")
+    phase=$(echo "${ilm_resp}" | jq -r '.indices."'"${idx}"'".phase // "not managed"' 2>/dev/null || echo "not managed")
   fi
 
-  echo -e "$idx\t$store\t$pri\t$policy\t$phase\t-" >> "${report_file}"
+  # Infer BACKING_DATA_STREAM from index name pattern
+  backing_ds="-"
+
+  if [[ "$idx" == .ds-* ]]; then
+    # Pattern: .ds-logs-prod-2025.03.11-000001 → logs-prod
+    backing_ds=$(echo "$idx" | sed 's/^\.ds-//; s/-[0-9]\{4\}\.[0-9]\{2\}\.[0-9]\{2\}-[0-9]\+$//')
+  elif [[ "$idx" =~ ^(logs|metrics|traces|audit|synthetics|security|fleet|filebeat|winlogbeat|heartbeat)- ]]; then
+    # Common Elastic integration prefixes - take first two parts
+    backing_ds=$(echo "$idx" | cut -d'-' -f1-2)
+  elif [[ "$idx" =~ ^[a-zA-Z0-9-]+\-[0-9]{4}\.[0-9]{2}\.[0-9]{2} ]]; then
+    # Generic date-based pattern: myapp-2025.03.11 → myapp
+    backing_ds=$(echo "$idx" | sed 's/-[0-9]\{4\}\.[0-9]\{2\}\.[0-9]\{2\}.*//')
+  fi
+
+  echo -e "$idx\t$store\t$pri\t$policy\t$phase\t$backing_ds" >> "${report_file}"
 done
 
+# Display final table
+echo -e "\n=== FINAL REPORT (only indices) ==="
 tail -n +2 "${report_file}" | sort -k1 | \
   (echo -e "INDEX\tSTORE_BYTES\tPRI_STORE_BYTES\tILM.POLICY\tPHASE\tBACKING_DATA_STREAM"; cat -) | \
   column -t -s $'\t'
