@@ -115,7 +115,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | {
         name: $name,
         version: (.version // "null"),
-        hot_min_age: (.policy.phases.hot.min_age // "-"),
+        hot_max_age: (.policy.phases.hot.max_age // "-"),
         hot_actions: (.policy.phases.hot.actions | if type == "object" then keys else [] end | join(", ") // "-"),
         warm_min_age: (.policy.phases.warm.min_age // "-"),
         warm_actions: (.policy.phases.warm.actions | if type == "object" then keys else [] end | join(", ") // "-"),
@@ -129,7 +129,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | [
         .name,
         .version,
-        .hot_min_age,
+        .hot_max_age,
         .hot_actions,
         .warm_min_age,
         .warm_actions,
