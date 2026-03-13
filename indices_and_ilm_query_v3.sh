@@ -115,7 +115,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
     | {
         name: $name,
         version: (.version // "null"),
-        hot_max_age: (.policy.phases.hot.max_age // "-"),
+        hot_max_age: (.policy.phases.hot.actions.rollover.max_age // "-"),
         hot_actions: (.policy.phases.hot.actions | if type == "object" then keys else [] end | join(", ") // "-"),
         warm_min_age: (.policy.phases.warm.min_age // "-"),
         warm_actions: (.policy.phases.warm.actions | if type == "object" then keys else [] end | join(", ") // "-"),
@@ -158,7 +158,7 @@ if [[ "${export_choice,,}" =~ ^(y|yes)$ ]]; then
 
   # Final CSV with header
   {
-    echo "policy_name,version,hot_min_age,hot_actions,warm_min_age,warm_actions,cold_min_age,cold_actions,frozen_min_age,frozen_actions,delete_min_age,delete_actions"
+    echo "policy_name,version,hot_max_age,hot_actions,warm_min_age,warm_actions,cold_min_age,cold_actions,frozen_min_age,frozen_actions,delete_min_age,delete_actions"
     [ -f "${tmp_file}" ] && cat "${tmp_file}"
   } > "${csv_file}"
 
